@@ -1,0 +1,6 @@
+# build artifacts
+/target/
+Cargo.lock
+
+# internal design notes (not for public repos)
+/docs/
