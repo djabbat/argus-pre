@@ -102,8 +102,7 @@ src/
 
 Design notes: the loop sends a compact prompt (stable prefix + memory pointers)
 to the model; one inference yields one JSON array of tool calls; results are
-compressed rather than re-encoded every turn (KV-cache friendly). See
-`docs/PATTERNS_V1.md` (internal) for the full pattern list.
+compressed rather than re-encoded every turn (KV-cache friendly).
 
 ## Security
 
@@ -123,7 +122,7 @@ compressed rather than re-encoded every turn (KV-cache friendly). See
 - **V1.4 (done)** — GAIA-Lite eval harness, Obsidian export, CDP browser
   (`navigate/click/type/snapshot`); grant kit (`GRANT_KIT.md`).
 - **V1.5 (done)** — plugin skills (SKILL.md playbooks + scripts), multi-worker
-  fusion (`argus-agent fusion`), OSC application draft (`OSC_APPLICATION_2026.md`, submission on hold).
+  fusion (`argus-agent fusion`), OSC fiscal-hosting material (GRANT_KIT.md).
 - **V1.6 (done)** — procedures from consolidation; skill registry (`skill search/install`);
   GAIA-L1 subset eval (60% · 8.4 s/task).
 - **V1.7 (done)** — CDP browser flows (`browser.eval` + multi-step `browser.flow`);
