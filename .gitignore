@@ -4,3 +4,4 @@ Cargo.lock
 
 # internal design notes (not for public repos)
 /docs/
+ai_check_out/
