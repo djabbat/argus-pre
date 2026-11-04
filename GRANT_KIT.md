@@ -1,7 +1,7 @@
 # ARGUS-OS1 — Open-Source Grant Kit (2026-10-02, V3.6)
 
-> Package for the **Open Source Collective ($17k)**, **Foresight Institute
-> ($50k)** and **Sovereign Tech Fund (€52.5k / 12 mo)** submissions.
+> Package for the **Open Source Collective (fiscal hosting Apply)**, **Foresight
+> Institute ($50k)** and **Sovereign Tech Fund (€52.5k / 12 mo)** submissions.
 > Everything here is public-safe. Internal design notes live in
 > `docs/PATTERNS_V1.md` (not committed) — do not copy verbatim.
 
@@ -107,7 +107,7 @@ Full runs: `benchmarks/*.md` (committed).
 - **Security**: SSRF-guard (string + DNS resolve), shell sandbox, approval
   gates, session-only modes, loop guard.
 
-## 8. Roadmap (6 months — see OSC application)
+## 8. Roadmap (6 months — see STF/OSC fiscal-hosting applications)
 
 M1–2: v1.0 stabilization, extend browser-recipe library (9 shipped), hub public deploy.
 M3–4: Telegram remote, MCP stream framing, graph+vector hybrid recall.
@@ -136,7 +136,8 @@ M5–6: multi-session TUI, community (Discord/issues), v1.1 release, docs.
 | File | Purpose |
 |---|---|
 | `GRANT_KIT.md` | this summary (public) |
-| `OSC_APPLICATION_2026.md` | filled OSC grant application ($17k) |
+| `OSC_FISCAL_HOSTING_APPLICATION.md` | Apply to OSC fiscal host (all form fields) |
+| `OSC_APPLICATION_2026.md` | переориентирован (грант OSC не существует; исторический) |
 | `OSC_COVER_LETTER.md` | one-page cover letter for OSC submission |
 | `STF_APPLICATION_2026.md` | filled Sovereign Tech Fund application (€52.5k, all form fields) |
 | `README.md` / `DOCS.md` | project docs |
