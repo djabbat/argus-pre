@@ -26,7 +26,7 @@ An agent loop (`Decide → Run → Compress → Repeat`) that:
 ```bash
 cd Services
 cargo build --bin argus-agent
-cargo test -p argus-pre --lib      # 8 unit tests (recover, SSRF, reflection, consolidate, heuristics)
+cargo test -p argus-pre --lib      # 46 unit tests (recover, SSRF, reflection, consolidate, heuristics)
 ```
 
 Requires a running LLM server. Default: Ollama on `http://127.0.0.1:11434`

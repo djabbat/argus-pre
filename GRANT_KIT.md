@@ -140,7 +140,7 @@ M5–6: multi-session TUI, community (Discord/issues), v1.1 release, docs.
 | `OSC_APPLICATION_2026.md` | переориентирован (грант OSC не существует; исторический) |
 | `OSC_COVER_LETTER.md` | one-page cover letter for OSC submission |
 | `STF_APPLICATION_2026.md` | filled Sovereign Tech Fund application (€52.5k, all form fields) |
-| `FORESIGHT_RFP_APPLICATION.md` | draft for Foresight RFP (next window; $50k) |
+| `FORESIGHT_RFP_APPLICATION.md` | справочная аналитика; реальная RFP Call 3 подана 31.10.2026 ($100K) |
 | `README.md` / `DOCS.md` | project docs |
 | `LICENSE` / `CONTRIBUTING.md` | legal & contribution guide |
 | `scripts/install.sh` / `.github/workflows/ci.yml` | installer & CI |
