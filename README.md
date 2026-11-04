@@ -1,6 +1,6 @@
 # ARGUS-OS1 — argus-pre
 
-Local-first AI agent core (V3.6) for ARGUS-OS1. Runs the agent loop entirely on Runs the agent loop entirely on
+Local-first AI agent core (V3.6) for ARGUS-OS1. Runs the agent loop entirely on
 your machine: local or cloud LLM, file-based memory, safe tool execution.
 
 > **Status: developer preview.** APIs and behavior are moving. Pin a release if
