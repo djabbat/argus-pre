@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - "argus-pre/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "argus-pre/**"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt -p argus-pre -- --check
+      - name: clippy
+        run: cargo clippy -p argus-pre -- -D warnings
+      - name: test
+        run: cargo test -p argus-pre --lib
+      - name: build (release)
+        run: cargo build --release --bin argus-agent
