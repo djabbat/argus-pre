@@ -2,6 +2,8 @@
 
 > Package for the **Open Source Collective (fiscal hosting Apply)**, **Foresight
 > Institute ($50k)** and **Sovereign Tech Fund (€52.5k / 12 mo)** submissions.
+> ⚠️ **STF: REJECTED 2026-11-10** (ID `YelaLvMK`) — «does not meet our criteria».
+> Постмортем: `~/Desktop/Services/grants/GLA/SovereignTechFund/STF_REJECTION_2026-11-10.md`.
 > Everything here is public-safe. Internal design notes live in
 > `docs/PATTERNS_V1.md` (not committed) — do not copy verbatim.
 
