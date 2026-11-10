@@ -1,7 +1,7 @@
 # ARGUS-OS1 — Open-Source Grant Kit (2026-10-02, V3.6)
 
 > Package for the **Open Source Collective (fiscal hosting Apply)**, **Foresight
-> Institute ($50k)** and **Sovereign Tech Fund (€52.5k / 12 mo)** submissions.
+> Institute ($50k)** and **Sovereign Tech Fund (€90k / 12 mo — финальная поданная сумма 04.11)** submissions.
 > ⚠️ **STF: REJECTED 2026-11-10** (ID `YelaLvMK`) — «does not meet our criteria».
 > Постмортем: `~/Desktop/Services/grants/GLA/SovereignTechFund/STF_REJECTION_2026-11-10.md`.
 > Everything here is public-safe. Internal design notes live in
@@ -141,7 +141,7 @@ M5–6: multi-session TUI, community (Discord/issues), v1.1 release, docs.
 | `OSC_FISCAL_HOSTING_APPLICATION.md` | Apply to OSC fiscal host (all form fields) |
 | `OSC_APPLICATION_2026.md` | переориентирован (грант OSC не существует; исторический) |
 | `OSC_COVER_LETTER.md` | one-page cover letter for OSC submission |
-| `STF_APPLICATION_2026.md` | filled Sovereign Tech Fund application (€52.5k, all form fields) |
+| `STF_APPLICATION_2026.md` | Sovereign Tech Fund application — финальная поданная форма: `STF_FORM_ANSWERS.md` (€90k, all form fields) |
 | `FORESIGHT_RFP_APPLICATION.md` | справочная аналитика; реальная RFP Call 3 подана 31.10.2026 ($100K) |
 | `README.md` / `DOCS.md` | project docs |
 | `LICENSE` / `CONTRIBUTING.md` | legal & contribution guide |
