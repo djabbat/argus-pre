@@ -97,7 +97,7 @@ impl Searcher for EpMcSearcher {
         let mut last_err: Option<String> = None;
         for variant in query_ladder(query) {
             let url = format!(
-                "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={}&format=json&pageSize={}&resultType=lite&sort=CITED%20desc",
+                "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={}&format=json&pageSize={}&resultType=lite",
                 urlencode(&variant),
                 limit.clamp(1, 10)
             );
