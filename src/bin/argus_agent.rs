@@ -3,6 +3,7 @@
 use argus_pre::agent::{AgentLoop, LlmConfig, LlmModel, LoopConfig, Mode, StubModel};
 use argus_pre::ledger::{self, Ledger, Outcome};
 use argus_pre::probe::{self, CorpusSearcher, EpMcSearcher, Searcher};
+use argus_pre::stance;
 use argus_pre::verify::{self, Cache, HttpFetcher};
 use argus_pre::memory::{Memory, NoteKind};
 use std::path::PathBuf;
@@ -62,7 +63,7 @@ fn main() {
   ticket list/show          P8a: единицы авторизованной работы (Ticket+Mandate)
   policy show/set           P8a: версионированные правила допуска (accept mode off/observe/auto)
   think [--once|--loop|--dry-run] [--probe epmc|corpus|none] [--corpus DIR]
-        [--limit N] [--min-score 0.20] [--offline] [--judge support|contradict]
+        [--limit N] [--min-score 0.20] [--offline] [--judge auto|support|contradict|off]
         [--qid <id>] [--seed N] [--k N]
         [--loop --max-cycles N --interval-secs N --budget-cycles N --budget-tokens N --quiet]
         [--report [--write] [--hours N]]
@@ -1934,7 +1935,7 @@ fn run_cycle(
         println!("  канал: {} · запрос: «{}»", cfg.channel, q);
     }
 
-    let (outcome, ids, note) = match cfg.channel.as_str() {
+    let (outcome, ids, note, stance_dec) = match cfg.channel.as_str() {
         "epmc" | "corpus" => {
             let found = if cfg.channel == "epmc" {
                 EpMcSearcher::new(cfg.offline).search(&q, cfg.limit)
@@ -1946,11 +1947,13 @@ fn run_cycle(
                     Outcome::None,
                     vec![],
                     format!("проба не удалась ({}): {e}", cfg.channel),
+                    None,
                 ),
                 Ok(cands) if cands.is_empty() => (
                     Outcome::None,
                     vec![],
                     format!("{}: 0 попаданий по «{q}»", cfg.channel),
+                    None,
                 ),
                 Ok(cands0) => {
                     let total = cands0.len();
@@ -1974,6 +1977,7 @@ fn run_cycle(
                                 "{}: найдено {total}, после семантического фильтра 0 (отсеяно {dropped})",
                                 cfg.channel
                             ),
+                            None,
                         )
                     } else {
                         let parsed: Vec<verify::Id> = cands
@@ -2011,12 +2015,58 @@ fn run_cycle(
                             cands.len(),
                             resolved.len()
                         );
+                        // ── позиция свидетельства (фикс 13 ноя) ──────────────────
+                        // Релевантность ≠ подтверждение: без этого шага Resolved давал
+                        // 0.500 → 0.500 в каждом цикле (15/15 за ночь). Классификатор
+                        // молчит, если нет якорей/маркеров или они конфликтуют;
+                        // тогда исход остаётся Evidence и p не двигается.
+                        let stance_dec: Option<stance::Decision> = match (
+                            verdict,
+                            cfg.judge.as_deref(),
+                        ) {
+                            (ledger::VerifyResult::Resolved, None | Some("auto")) => {
+                                let ds: Vec<stance::Decision> = cands
+                                    .iter()
+                                    .map(|c| {
+                                        stance::classify(
+                                            &pick.text,
+                                            &c.title,
+                                            c.abstract_text.as_deref().unwrap_or(""),
+                                        )
+                                    })
+                                    .collect();
+                                if !cfg.quiet {
+                                    for (c, d) in cands.iter().zip(ds.iter()) {
+                                        println!(
+                                            "    stance {} {} ({:.2}, {}) — {}",
+                                            c.id,
+                                            d.stance.as_str(),
+                                            d.confidence,
+                                            d.source,
+                                            d.reason
+                                        );
+                                    }
+                                }
+                                Some(stance::aggregate(&ds))
+                            }
+                            _ => None,
+                        };
+                        let note = match &stance_dec {
+                            Some(d) => format!("{note} · stance {}/{}: {}", d.stance.as_str(), d.confidence, d.reason),
+                            None => note,
+                        };
                         let outcome = match verdict {
                             ledger::VerifyResult::Fabricated => Outcome::Fabricated,
                             ledger::VerifyResult::Resolved => match cfg.judge.as_deref() {
                                 Some("support") => Outcome::Support,
                                 Some("contradict") => Outcome::Contradict,
-                                _ => Outcome::Evidence,
+                                _ => match stance_dec.as_ref().filter(|d| d.acts()) {
+                                    Some(d) if d.stance == stance::Stance::Support => Outcome::Support,
+                                    Some(d) if d.stance == stance::Stance::Contradict => {
+                                        Outcome::Contradict
+                                    }
+                                    _ => Outcome::Evidence,
+                                },
                             },
                             ledger::VerifyResult::Unresolved => Outcome::None,
                         };
@@ -2025,7 +2075,7 @@ fn run_cycle(
                         } else {
                             resolved
                         };
-                        (outcome, ids_out, note)
+                        (outcome, ids_out, note, stance_dec)
                     }
                 }
             }
@@ -2034,11 +2084,20 @@ fn run_cycle(
             Outcome::None,
             vec![],
             "канал пробы не выбран (--probe epmc|corpus)".to_string(),
+            None,
         ),
     };
 
     let cycle = led
-        .apply(&pick.id, outcome, &format!("probe:{}", cfg.channel), ids, &note, 0)
+        .apply_judged(
+            &pick.id,
+            outcome,
+            &format!("probe:{}", cfg.channel),
+            ids,
+            &note,
+            0,
+            stance_dec.as_ref(),
+        )
         .ok_or_else(|| "вопрос исчез из леджера".to_string())?;
     let _ = led.save(sdir);
     let _ = led.append_cycle(sdir, &cycle);
@@ -2266,27 +2325,62 @@ fn write_daily_report(sdir: &PathBuf, hours: Option<f64>) -> std::io::Result<Pat
     let _ = writeln!(s, "| fabricated_identifiers | {} |", m.fabricated_identifiers);
     let _ = writeln!(s, "| mean_abs_logit_shift | {:.3} |", m.mean_abs_logit_shift);
     let _ = writeln!(s, "| gaps_recorded | {} |", m.gaps_recorded);
+    let (judged, acted) = stance_stats(&led.cycles);
+    let _ = writeln!(s, "| свидетельств оценено позиционно | {judged} |");
+    let _ = writeln!(s, "| из них p сдвинута | {acted} |");
     let _ = writeln!(s, "\n## Бюджет\n");
     let _ = writeln!(s, "- циклов за час: {} / {}", budget.recent.len(), budget.max_cycles_per_hour);
     let _ = writeln!(s, "- циклов за сутки: {}", budget.cycles_today);
     let _ = writeln!(s, "- токенов за сутки: {} / {}", budget.tokens_today, budget.max_tokens_per_day);
 
     let _ = writeln!(s, "\n## Леджер\n");
-    let _ = writeln!(s, "| id | p | probes | status | вопрос |\n|---|---|---|---|---|");
+    let _ = writeln!(s, "| id | p | probes | status | форма | вопрос |\n|---|---|---|---|---|---|");
     let mut qs = led.questions.clone();
     qs.sort_by(|a, b| a.status_key().cmp(&b.status_key()).then(a.id.cmp(&b.id)));
     for q in qs {
         let text: String = q.text.chars().take(90).collect();
-        let _ = writeln!(s, "| {} | {:.2} | {} | {} | {} |", q.id, q.p_true, q.probes, q.status_str(), text.replace('|', "/"));
+        let _ = writeln!(
+            s,
+            "| {} | {:.2} | {} | {} | {} | {} |",
+            q.id,
+            q.p_true,
+            q.probes,
+            q.status_str(),
+            q.form().as_str(),
+            text.replace('|', "/")
+        );
+    }
+    // Честная пометка: у темы/оценки p не определена — литература их не «закроет»
+    let non_prop: Vec<_> = led
+        .questions
+        .iter()
+        .filter(|q| !q.form().allows_lr() && q.status == ledger::QStatus::Open)
+        .collect();
+    if !non_prop.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n> ⚠️ {} открытых вопросов — не бинарные претензии, p у них не определена и двигаться не может.\n> Переформулировать в «да/нет» (`ledger form <id>` покажет форму):",
+            non_prop.len()
+        );
+        for q in non_prop {
+            let _ = writeln!(s, "> - {} [{}] {}", q.id, q.form().as_str(), q.text);
+        }
     }
 
     let _ = writeln!(s, "\n## Последние циклы\n");
-    let _ = writeln!(s, "| когда | вопрос | вердикт | p до → после | что нашли |\n|---|---|---|---|---|");
+    let _ = writeln!(s, "| когда | вопрос | вердикт | stance | p до → после | что нашли |\n|---|---|---|---|---|---|");
     for c in led.cycles.iter().rev().take(15) {
         let _ = writeln!(
             s,
-            "| {} | {} | {:?} | {:.3} → {:.3} | {} |",
-            c.at, c.qid, c.verifier, c.before, c.after, c.note.replace('|', "/")
+            "| {} | {} | {:?} | {}/{} | {:.3} → {:.3} | {} |",
+            c.at,
+            c.qid,
+            c.verifier,
+            c.stance.as_deref().unwrap_or("—"),
+            c.stance_conf,
+            c.before,
+            c.after,
+            c.note.replace('|', "/")
         );
     }
 
@@ -2325,7 +2419,19 @@ fn print_idle_report(sdir: &PathBuf) {
     println!("refutation_share:           {:.2}", m.refutation_share);
     println!("mean_abs_logit_shift:       {:.3}", m.mean_abs_logit_shift);
     println!("gaps_recorded:              {}", m.gaps_recorded);
+    let (judged, acted) = stance_stats(&led.cycles);
+    println!("stance: оценено {judged}, из них сдвинули p {acted}");
     println!("вердикт: {verdict}");
+}
+
+/// Сколько циклов получили позиционную оценку и сколько из них реально сдвинули p.
+fn stance_stats(cycles: &[ledger::Cycle]) -> (usize, usize) {
+    let judged = cycles.iter().filter(|c| c.stance.is_some()).count();
+    let acted = cycles
+        .iter()
+        .filter(|c| (c.after - c.before).abs() > f64::EPSILON)
+        .count();
+    (judged, acted)
 }
 
 fn cmd_ledger(args: &[String], sdir: &PathBuf) {
@@ -2337,18 +2443,36 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
                 println!("леджер пуст: ledger seed | ledger add \"вопрос\"");
                 return;
             }
-            println!("{:<12} {:>6} {:>3}  {:<9} {:<3} {}", "id", "p", "n", "status", "вид", "вопрос");
+            println!(
+                "{:<12} {:>6} {:>3}  {:<9} {:<3} {:<12} {}",
+                "id", "p", "n", "status", "вид", "форма", "вопрос"
+            );
             let mut qs = led.questions.clone();
             qs.sort_by(|a, b| a.status_key().cmp(&b.status_key()).then(a.id.cmp(&b.id)));
             for q in qs {
+                let form = q.form().as_str();
+                let flag = if q.form().allows_lr() { "" } else { "⚠️ " };
                 println!(
-                    "{:<12} {:>6.2} {:>3}  {:<9} {:<3} {}",
+                    "{:<12} {:>6.2} {:>3}  {:<9} {:<3} {:<12} {flag}{}",
                     q.id,
                     q.p_true,
                     q.probes,
                     q.status_str(),
                     q.kind_str(),
+                    form,
                     q.text
+                );
+            }
+            let non_prop = led
+                .questions
+                .iter()
+                .filter(|q| !q.form().allows_lr() && q.status == ledger::QStatus::Open)
+                .count();
+            if non_prop > 0 {
+                println!();
+                println!(
+                    "⚠️  {non_prop} открытых вопросов — не бинарные претензии: p у них не определена,
+   свидетельство её сдвинуть не может. Переформулируй в «… ли …?»"
                 );
             }
         }
@@ -2366,6 +2490,13 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
             let id = led.add(&text, p);
             let _ = led.save(sdir);
             println!("✅ добавлен {id}: {text}");
+            let form = led.get(&id).map(|q| q.form()).unwrap_or(argus_pre::stance::QForm::Topic);
+            if !form.allows_lr() {
+                println!(
+                    "⚠️ форма «{}»: p у такого вопроса не определена, свидетельство её не сдвинет.\n   Если нужна байесовская бухгалтерия — переформулируй как «… ли …?»",
+                    form.as_str()
+                );
+            }
         }
         "seed" => {
             let mut n = 0;
@@ -2390,7 +2521,17 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
             match led.get(&id) {
                 Some(q) => {
                     println!("{}\n  {}", q.id, q.text);
-                    println!("  p={:.3} (prev {:.3}) status={} probes={}", q.p_true, q.p_prev, q.status_str(), q.probes);
+                    println!(
+                        "  p={:.3} (prev {:.3}) status={} probes={} форма={}",
+                        q.p_true,
+                        q.p_prev,
+                        q.status_str(),
+                        q.probes,
+                        q.form().as_str()
+                    );
+                    if !q.form().allows_lr() {
+                        println!("  ⚠️ форма не бинарная: p не определена, LR не применяется");
+                    }
                     println!("  identifiers: {:?}", q.identifiers);
                     println!("  gaps: {:?}", q.gaps);
                     println!("  refutations: {:?}", q.refutations);

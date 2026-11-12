@@ -11,5 +11,6 @@ pub mod plugins;
 pub mod resume;
 pub mod probe;
 pub mod skills;
+pub mod stance;
 pub mod tickets;
 pub mod verify;

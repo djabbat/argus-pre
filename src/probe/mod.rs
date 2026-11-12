@@ -21,6 +21,10 @@ pub struct Candidate {
     pub id: String,
     pub title: String,
     pub source: String,
+    /// абстракт (Europe PMC `resultType=core`): нужен для оценки позиции свидетельства
+    /// (`crate::stance`). `None` — заголовок есть, текста нет.
+    #[allow(clippy::struct_field_names)]
+    pub abstract_text: Option<String>,
 }
 
 pub trait Searcher {
@@ -97,7 +101,7 @@ impl Searcher for EpMcSearcher {
         let mut last_err: Option<String> = None;
         for variant in query_ladder(query) {
             let url = format!(
-                "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={}&format=json&pageSize={}&resultType=lite",
+                "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={}&format=json&pageSize={}&resultType=core",
                 urlencode(&variant),
                 limit.clamp(1, 10)
             );
@@ -175,6 +179,11 @@ pub fn parse_epmc_candidates(body: &str, source: &str) -> Vec<Candidate> {
             id,
             title,
             source: source.to_string(),
+            abstract_text: r
+                .get("abstractText")
+                .and_then(|t| t.as_str())
+                .map(|t| t.to_string())
+                .filter(|t| !t.trim().is_empty()),
         });
     }
     out
@@ -255,6 +264,7 @@ impl Searcher for CorpusSearcher {
                         id,
                         title,
                         source: format!("corpus:{}", f.display()),
+                        abstract_text: None,
                     },
                 ));
             }
@@ -414,6 +424,22 @@ pub fn stem_overlap(query: &str, title: &str) -> f32 {
     hit as f32 / q.len() as f32
 }
 
+/// Релевантность кандидата: заголовок + абстракт (если есть).
+///
+/// Зачем абстракт: доля пересечения стемов считается от длины ЗАПРОСА, поэтому на
+/// длинных вопросах («Is phototoxicity a limiting factor for multi-day GFP time-lapse
+/// imaging?») заголовок почти никогда не даёт 0.20 и все кандидаты отсеивались — цикл
+/// честно писал «0 после фильтра» и не доходил до оценки позиции.
+pub fn relevance_score_candidate(query: &str, c: &Candidate) -> f32 {
+    match c.abstract_text.as_deref() {
+        Some(a) if !a.trim().is_empty() => {
+            let text = format!("{} {}", c.title, a);
+            relevance_score(query, &text)
+        }
+        _ => relevance_score(query, &c.title),
+    }
+}
+
 /// Гибрид: доля пересечения стемов, либо половинный вес символьной близости (триграммы).
 pub fn relevance_score(query: &str, title: &str) -> f32 {
     const DIM: usize = 512;
@@ -433,7 +459,7 @@ pub fn filter_relevant_scored(
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for c in cands {
-        let sc = relevance_score(query, &c.title);
+        let sc = relevance_score_candidate(query, &c);
         if sc >= min_score {
             kept.push(c);
         } else {
@@ -520,8 +546,8 @@ mod tests {
     fn relevance_filter_drops_titles_without_query_terms() {
         let q = "fiducial-autofocus drift OpenFlexure";
         let cands = vec![
-            Candidate { id: "PMID:1".into(), title: "Fiducial markers for autofocus drift correction".into(), source: "e".into() },
-            Candidate { id: "PMID:2".into(), title: "Biochar improves the nutrient cycle in soils".into(), source: "e".into() },
+            Candidate { id: "PMID:1".into(), title: "Fiducial markers for autofocus drift correction".into(), source: "e".into(), abstract_text: None },
+            Candidate { id: "PMID:2".into(), title: "Biochar improves the nutrient cycle in soils".into(), source: "e".into(), abstract_text: None },
         ];
         let (kept, dropped) = filter_relevant(q, cands);
         assert_eq!(dropped.len(), 1);
@@ -531,11 +557,35 @@ mod tests {
     }
 
     #[test]
+    fn abstract_text_raises_relevance_for_long_query() {
+        let q = "phototoxicity limiting factor multi day GFP time lapse imaging";
+        let bare = Candidate {
+            id: "PMID:10".into(),
+            title: "From Static to Dynamic: Fluorescence Imaging Advances".into(),
+            source: "e".into(),
+            abstract_text: None,
+        };
+        let with_abs = Candidate {
+            abstract_text: Some(
+                "Phototoxicity is a limiting factor for multi-day GFP time-lapse imaging;                  we quantify dose budgets and show that fluorescence imaging of live cells                  requires careful light management."
+                    .into(),
+            ),
+            ..bare.clone()
+        };
+        assert!(
+            relevance_score_candidate(q, &with_abs) > relevance_score_candidate(q, &bare),
+            "абстракт должен повышать релевантность"
+        );
+        assert!(relevance_score_candidate(q, &with_abs) >= 0.20);
+    }
+
+    #[test]
     fn relevance_filter_accepts_shared_prefix() {
         let cands = vec![Candidate {
             id: "PMID:33443571".into(),
             title: "Centriole and PCM cooperatively recruit CEP192 to spindle poles".into(),
             source: "e".into(),
+            abstract_text: None,
         }];
         let (kept, dropped) = filter_relevant("Centrin1 GFP SAS mCherry", cands);
         assert_eq!(dropped.len(), 0, "префикс «Centr» должен засчитываться");

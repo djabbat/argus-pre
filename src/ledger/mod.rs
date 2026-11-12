@@ -44,7 +44,7 @@ pub enum QStatus {
     Gap,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum VerifyResult {
     /// идентификатор(ы) резолвнуты
@@ -113,6 +113,10 @@ pub struct Question {
     /// свидетельства, 0.35 для найденного но не суждённого, 0.1 для «ничего не нашли»
     #[serde(default)]
     pub last_error: f32,
+    /// форма вопроса (бинарная претензия / количественная оценка / поисковая тема).
+    /// `None` в старых леджерах → вычисляется при загрузке из текста.
+    #[serde(default)]
+    pub form: Option<crate::stance::QForm>,
 }
 
 fn default_kind() -> QKind {
@@ -141,7 +145,14 @@ impl Question {
             consecutive_gaps: 0,
             expected: None,
             last_error: 0.0,
+            form: Some(crate::stance::detect_form(text)),
         }
+    }
+
+    /// Форма вопроса: сохранённая либо (для старых записей) выведенная из текста.
+    pub fn form(&self) -> crate::stance::QForm {
+        self.form
+            .unwrap_or_else(|| crate::stance::detect_form(&self.text))
     }
 
     pub fn kind_str(&self) -> &'static str {
@@ -188,6 +199,19 @@ pub struct Cycle {
     #[serde(default)]
     pub tokens: u64,
     pub at: String,
+    /// позиция свидетельства относительно вопроса (`support`/`contradict`/`neutral`),
+    /// оценённая `crate::stance`; `None` — старые циклы и ветки без оценки
+    #[serde(default)]
+    pub stance: Option<String>,
+    /// уверенность классификатора 0..1
+    #[serde(default)]
+    pub stance_conf: f32,
+    /// откуда позиция: `lexical:title+abstract` и т.п.
+    #[serde(default)]
+    pub stance_source: Option<String>,
+    /// форма вопроса на момент цикла: `proposition`/`quantitative`/`topic`
+    #[serde(default)]
+    pub form: Option<String>,
 }
 
 /// Оценка вопроса для очереди (спека §3.1).
@@ -417,6 +441,13 @@ impl Ledger {
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
+        let mut questions = questions;
+        // старые леджеры без поля `form`: достраиваем при загрузке (не переписывая файл сами по себе)
+        for q in questions.iter_mut() {
+            if q.form.is_none() {
+                q.form = Some(crate::stance::detect_form(&q.text));
+            }
+        }
         let cycles: Vec<Cycle> = fs::read_to_string(d.join("cycles.jsonl"))
             .ok()
             .map(|s| {
@@ -504,7 +535,26 @@ impl Ledger {
     }
 
     pub fn select_next_for(&self, seed: u64, k: usize, lit_channel: bool) -> Option<Scored> {
-        let ranked = self.ranked_for(Utc::now(), lit_channel);
+        let now = Utc::now();
+        // Честная очередь (фикс 13 ноя): без штрафа за недавний повтор один и тот же вопрос
+        // выигрывал рулетку 5 раз в час (q-b6e15701), а 14 других не опрашивались вообще.
+        // Штраф 1/4 за каждый прогон за последний час: после третьего повтора вопрос
+        // уступает место тем, кого давно не трогали — возникает round-robin вместо залипания.
+        let mut ranked: Vec<Scored> = self
+            .ranked_for(now, lit_channel)
+            .into_iter()
+            .map(|mut s| {
+                let hits = self.recent_hits(&s.id, now, 1);
+                s.score *= 0.25_f64.powi(hits.min(8) as i32);
+                s
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         if ranked.is_empty() {
             return None;
         }
@@ -524,6 +574,20 @@ impl Ledger {
         pool.last().map(|s| (*s).clone())
     }
 
+    /// Сколько раз вопрос опрашивался за последние `hours` часов (по журналу циклов).
+    pub fn recent_hits(&self, id: &str, now: DateTime<Utc>, hours: i64) -> usize {
+        let cutoff = now - chrono::Duration::hours(hours.max(1));
+        self.cycles
+            .iter()
+            .filter(|c| c.qid == id)
+            .filter(|c| {
+                parse_ts(&c.at)
+                    .map(|t| t >= cutoff)
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
     /// Применить исход пробы к вопросу и вернуть запись цикла (спека §3.4–3.5).
     pub fn apply(
         &mut self,
@@ -534,11 +598,39 @@ impl Ledger {
         note: &str,
         tokens: u64,
     ) -> Option<Cycle> {
+        self.apply_judged(id, outcome, probe, identifiers, note, tokens, None)
+    }
+
+    /// То же, но с записью позиции свидетельства (`crate::stance::Decision`) в цикл.
+    ///
+    /// Гейт спецификации §2: вероятность двигается **только** у вопроса-претензии
+    /// (`QForm::Proposition`). Для количественного вопроса или поисковой темы
+    /// исход `Support`/`Contradict` деградирует до `Evidence`: идентификаторы пишутся,
+    /// `p` не меняется. Причина — у темы нет истинностного значения, у оценки нет «да/нет».
+    pub fn apply_judged(
+        &mut self,
+        id: &str,
+        outcome: Outcome,
+        probe: &str,
+        identifiers: Vec<String>,
+        note: &str,
+        tokens: u64,
+        stance: Option<&crate::stance::Decision>,
+    ) -> Option<Cycle> {
         let now = now_rfc3339();
         let q = self.questions.iter_mut().find(|q| q.id == id)?;
         let before = q.p_true;
+        let form = q.form();
         q.probes += 1;
         q.last_probed = Some(now.clone());
+        // бюджет проб исчерпан, а вопрос не закрыт → он не должен висеть «open» невидимым
+        if q.probes == MAX_PROBES_PER_QUESTION {
+            if q.status == QStatus::Open {
+                q.status = QStatus::Gap;
+            }
+            q.gaps
+                .push(format!("исчерпан бюджет {MAX_PROBES_PER_QUESTION} проб без закрытия"));
+        }
 
         let (verifier, after) = match outcome {
             // выдуманный идентификатор: hard fail, вероятность НЕ двигается
@@ -563,11 +655,25 @@ impl Ledger {
                     q.last_error = 0.1;
                     (VerifyResult::Unresolved, before)
                 } else {
-                    q.consecutive_gaps = 0;
-                    q.last_error = 0.35;
+                    // «новых идентификаторов нет» — это пробел, а не прогресс (спека §3.6):
+                    // повторный прогон того же запроса возвращает те же PMID, и без этого
+                    // счётчика вопрос висел в очереди до потолка из 12 проб.
+                    let novel = identifiers.iter().any(|i| !q.identifiers.contains(i));
                     for i in &identifiers {
                         if !q.identifiers.contains(i) {
                             q.identifiers.push(i.clone());
+                        }
+                    }
+                    if novel {
+                        q.consecutive_gaps = 0;
+                        q.last_error = 0.35;
+                    } else {
+                        q.consecutive_gaps += 1;
+                        q.last_error = 0.1;
+                        q.gaps
+                            .push(format!("{note} [новых идентификаторов нет]"));
+                        if q.consecutive_gaps >= MAX_CONSECUTIVE_GAPS {
+                            q.status = QStatus::Gap;
                         }
                     }
                     (VerifyResult::Resolved, before)
@@ -578,6 +684,29 @@ impl Ledger {
                     // свидетельство без идентификатора не засчитывается
                     q.gaps.push(format!("{note} [no identifier]"));
                     (VerifyResult::Unresolved, before)
+                } else if !form.allows_lr() {
+                    // форма вопроса не допускает байесовского сдвига: пишем ID, не трогаем p
+                    q.gaps.push(format!(
+                        "{note} [form={}: p не определена] ",
+                        form.as_str()
+                    ));
+                    q.consecutive_gaps = 0;
+                    q.last_error = 0.35;
+                    for i in &identifiers {
+                        if !q.identifiers.contains(i) {
+                            q.identifiers.push(i.clone());
+                        }
+                    }
+                    (VerifyResult::Resolved, before)
+                } else if identifiers.iter().all(|i| q.identifiers.contains(i)) {
+                    // Те же идентификаторы, что уже учтены: повторный прогон той же пробы
+                    // не должен начислять LR второй раз (иначе одна статья двигает веру
+                    // бесконечно — цикл с тем же запросом возвращает те же PMID).
+                    q.gaps
+                        .push(format!("{note} [повтор: идентификаторы уже учтены, LR не начислен]"));
+                    q.consecutive_gaps += 1;
+                    q.last_error = 0.1;
+                    (VerifyResult::Resolved, before)
                 } else {
                     let lr = if outcome == Outcome::Support {
                         LR_SUPPORT
@@ -617,6 +746,10 @@ impl Ledger {
             note: note.to_string(),
             tokens,
             at: now,
+            stance: stance.map(|s| s.stance.as_str().to_string()),
+            stance_conf: stance.map(|s| s.confidence).unwrap_or(0.0),
+            stance_source: stance.map(|s| s.source.to_string()),
+            form: Some(form.as_str().to_string()),
         };
         self.cycles.push(cycle.clone());
         Some(cycle)
@@ -811,7 +944,7 @@ mod tests {
     #[test]
     fn resolved_evidence_moves_p_and_records_id() {
         let mut l = Ledger::default();
-        let id = l.add("вопрос", None);
+        let id = l.add("Держит ли тестовый стенд дрейф < 1 px за 72 ч?", None);
         let c = l
             .apply(
                 &id,
@@ -837,8 +970,8 @@ mod tests {
     #[test]
     fn fresh_questions_still_have_positive_score() {
         let mut l = Ledger::default();
-        let q1 = l.add("свежий1", None);
-        let q2 = l.add("свежий2", None);
+        let q1 = l.add("Держит ли свежий стенд A дрейф < 1 px?", None);
+        let q2 = l.add("Держит ли свежий стенд B дрейф < 1 px?", None);
         let r = l.ranked(Utc::now());
         assert_eq!(r.len(), 2);
         assert!(r.iter().all(|s| s.score > 0.0), "пол свежести не работает: {r:?}");
@@ -853,9 +986,9 @@ mod tests {
     #[test]
     fn selection_is_seeded_and_skips_blocks() {
         let mut l = Ledger::default();
-        let a = l.add("вопрос A", None);
-        let b = l.add("вопрос B", Some(0.2));
-        let c = l.add("вопрос C", Some(0.8));
+        let a = l.add("Держит ли стенд A дрейф < 1 px за 72 ч?", None);
+        let b = l.add("Держит ли стенд B дрейф < 1 px за 72 ч?", Some(0.2));
+        let c = l.add("Держит ли стенд C дрейф < 1 px за 72 ч?", Some(0.8));
         // C и B получают историю: у B был сдвиг → surprise выше
         l.apply(&b, Outcome::Support, "p", vec!["PMID:1234567".into()], "n", 0);
         let s1 = l.select_next(42, 3).unwrap();
@@ -873,9 +1006,17 @@ mod tests {
     #[test]
     fn closed_question_leaves_queue() {
         let mut l = Ledger::default();
-        let id = l.add("закрываемый", None);
-        for _ in 0..8 {
-            l.apply(&id, Outcome::Contradict, "p", vec!["PMID:7654321".into()], "no", 0);
+        let id = l.add("Держит ли закрываемый стенд дрейф < 1 px?", None);
+        // разные идентификаторы: одна и та же статья не может опровергать вопрос 8 раз
+        for i in 0..8 {
+            l.apply(
+                &id,
+                Outcome::Contradict,
+                "p",
+                vec![format!("PMID:765432{i}")],
+                "no",
+                0,
+            );
         }
         let q = l.get(&id).unwrap();
         assert_eq!(q.status, QStatus::Refuted, "p={}", q.p_true);
@@ -914,8 +1055,8 @@ mod tests {
     #[test]
     fn prediction_error_drives_attention() {
         let mut l = Ledger::default();
-        let revised = l.add("вопрос, по которому пришло свидетельство", None);
-        let empty = l.add("вопрос, по которому пусто", None);
+        let revised = l.add("Держит ли стенд со свидетельством дрейф < 1 px?", None);
+        let empty = l.add("Держит ли стенд без свидетельства дрейф < 1 px?", None);
         // свидетельство → ошибка предсказания высокая
         l.apply(&revised, Outcome::Support, "probe", vec!["PMID:23663408".into()], "ok", 0);
         // пустая проба → ошибка низкая (это свойство канала, а не мира)
@@ -951,6 +1092,142 @@ mod tests {
         assert_eq!(l.reopen_stale_gaps(Utc::now() + chrono::Duration::hours(25), 24), 1);
         assert_eq!(l.get(&id).unwrap().status, QStatus::Open);
         assert_eq!(l.get(&id).unwrap().consecutive_gaps, 0);
+    }
+
+    // ── фикс 13 ноя: форма вопроса, повтор в очереди, исчерпание проб ──────
+
+    #[test]
+    fn topic_question_never_moves_p_even_with_identifiers() {
+        let mut l = Ledger::default();
+        let id = l.add("fiducial autofocus drift long-term time-lapse open microscope", None);
+        let c = l
+            .apply(&id, Outcome::Support, "probe:epmc", vec!["PMID:23663408".into()], "нашли", 0)
+            .unwrap();
+        assert_eq!(c.before, c.after, "у темы нет истинностного значения");
+        assert_eq!(c.form.as_deref(), Some("topic"));
+        let q = l.get(&id).unwrap();
+        assert_eq!(q.p_true, 0.5);
+        assert_eq!(q.identifiers, vec!["PMID:23663408".to_string()], "ID всё равно фиксируем");
+        assert!(q.gaps.iter().any(|g| g.contains("form=topic")), "{:?}", q.gaps);
+    }
+
+    #[test]
+    fn quantitative_question_never_moves_p() {
+        let mut l = Ledger::default();
+        let id = l.add("Насколько дрейфует фокус за 8 ч без автофокуса?", None);
+        let c = l
+            .apply(&id, Outcome::Contradict, "probe:epmc", vec!["PMID:23663408".into()], "", 0)
+            .unwrap();
+        assert_eq!(c.before, c.after);
+        assert_eq!(c.form.as_deref(), Some("quantitative"));
+    }
+
+    #[test]
+    fn proposition_moves_p_and_records_stance() {
+        use crate::stance::{Decision, Stance};
+        let mut l = Ledger::default();
+        let id = l.add("Держит ли стенд дрейф < 1 px за 72 ч?", None);
+        let d = Decision {
+            stance: Stance::Support,
+            confidence: 0.85,
+            source: "lexical:title+abstract",
+            reason: "we demonstrated … 72 h".into(),
+        };
+        let c = l
+            .apply_judged(
+                &id,
+                Outcome::Support,
+                "probe:epmc",
+                vec!["PMID:23663408".into()],
+                "суждено",
+                0,
+                Some(&d),
+            )
+            .unwrap();
+        assert!(c.after > c.before);
+        assert_eq!(c.stance.as_deref(), Some("support"));
+        assert!((c.stance_conf - 0.85).abs() < 1e-6);
+        assert_eq!(c.stance_source.as_deref(), Some("lexical:title+abstract"));
+        assert_eq!(c.form.as_deref(), Some("proposition"));
+    }
+
+    #[test]
+    fn same_identifier_does_not_move_p_twice() {
+        let mut l = Ledger::default();
+        let id = l.add("Держит ли стенд дрейф < 1 px за 72 ч?", None);
+        let ids = vec!["PMID:23663408".to_string()];
+        let c1 = l
+            .apply(&id, Outcome::Support, "probe:epmc", ids.clone(), "первый раз", 0)
+            .unwrap();
+        let p1 = c1.after;
+        assert!(p1 > c1.before);
+        let c2 = l
+            .apply(&id, Outcome::Support, "probe:epmc", ids, "тот же PMID", 0)
+            .unwrap();
+        assert_eq!(c2.before, c2.after, "одна статья — одно свидетельство");
+        let q = l.get(&id).unwrap();
+        assert!(
+            q.gaps.iter().any(|g| g.contains("повтор")),
+            "причина отказа от LR должна быть записана: {:?}",
+            q.gaps
+        );
+    }
+
+    #[test]
+    fn same_evidence_three_times_moves_question_to_gap() {
+        let mut l = Ledger::default();
+        let id = l.add("Держит ли стенд дрейф < 1 px?", None);
+        // первый цикл — прогресс (ID новый), дальше MAX_CONSECUTIVE_GAPS прогонов без новизны
+        for _ in 0..MAX_CONSECUTIVE_GAPS + 1 {
+            l.apply(
+                &id,
+                Outcome::Evidence,
+                "probe:epmc",
+                vec!["PMID:23663408".into()],
+                "то же самое",
+                0,
+            );
+        }
+        let q = l.get(&id).unwrap();
+        assert_eq!(q.status, QStatus::Gap, "повтор без новых ID должен освобождать очередь");
+        assert!(q.gaps.iter().any(|g| g.contains("новых идентификаторов нет")));
+    }
+
+    #[test]
+    fn repeated_question_yields_to_unprobed_ones() {
+        let mut l = Ledger::default();
+        let hot = l.add("Держит ли горячий стенд дрейф < 1 px за 72 ч?", None);
+        let cold: Vec<String> = (0..4)
+            .map(|i| l.add(&format!("Держит ли холодный стенд {i} дрейф < 1 px?"), None))
+            .collect();
+        for _ in 0..4 {
+            l.apply(&hot, Outcome::None, "probe:epmc", vec![], "0 попаданий", 0);
+        }
+        // K=5: холодных четверо — все должны попадать в пул, иначе тест проверяет не то
+        let picks: Vec<String> = (0..20).map(|s| l.select_next(s, 5).unwrap().id).collect();
+        let hot_picks = picks.iter().filter(|p| **p == hot).count();
+        assert!(hot_picks <= 5, "повтор доминирует: {hot_picks} /20");
+        for c in &cold {
+            assert!(picks.contains(c), "вопрос {c} ни разу не выбран: {picks:?}");
+        }
+    }
+
+    #[test]
+    fn exhausted_probe_budget_never_hides_open_question() {
+        let mut l = Ledger::default();
+        let id = l.add("Держит ли исчерпывающийся стенд дрейф < 1 px?", None);
+        for _ in 0..MAX_PROBES_PER_QUESTION {
+            l.apply(&id, Outcome::None, "probe:epmc", vec![], "0 попаданий", 0);
+        }
+        let q = l.get(&id).unwrap();
+        assert_eq!(q.probes, MAX_PROBES_PER_QUESTION);
+        if q.status == QStatus::Open {
+            // если остался open — обязан быть выбираемым, иначе он невидим в очереди
+            assert!(l.select_next(1, 3).is_some());
+        } else {
+            assert_eq!(q.status, QStatus::Gap);
+            assert!(q.gaps.iter().any(|g| g.contains("исчерпан бюджет")));
+        }
     }
 
     #[test]
