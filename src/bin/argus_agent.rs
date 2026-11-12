@@ -1,6 +1,7 @@
 //! argus-agent V3.6 — CLI-вход: init / run / memory / skill / session / task / plugin / bench / eval / fusion / serve
 //! Паттерны: P1 (цикл + реальная LLM), P2 (файловая память), P4 (режимы-сессия).
 use argus_pre::agent::{AgentLoop, LlmConfig, LlmModel, LoopConfig, Mode, StubModel};
+use argus_pre::ledger::{self, Ledger, Outcome};
 use argus_pre::memory::{Memory, NoteKind};
 use std::path::PathBuf;
 
@@ -38,6 +39,8 @@ fn main() {
         "plugin" => cmd_plugin(&args, &sdir),
         "mcp" => cmd_mcp(&args, &sdir),
         "effects" => cmd_effects(&args, &sdir),
+        "think" => cmd_think(&args, &sdir),
+        "ledger" => cmd_ledger(&args, &sdir),
         "ticket" => cmd_ticket(&args, &sdir),
         "policy" => cmd_policy(&args, &sdir),
         "plan" => println!("План-режим (read-only): запусти run --mode plan."),
@@ -56,6 +59,10 @@ fn main() {
                         durable side-effect очередь (P8d): notify/report/external/command/outbox/internal
   ticket list/show          P8a: единицы авторизованной работы (Ticket+Mandate)
   policy show/set           P8a: версионированные правила допуска (accept mode off/observe/auto)
+  think [--once|--dry-run] [--seed N] [--k N] [--report]
+                        P9: внутренний цикл (idle inference) — выбрать вопрос из леджера
+  ledger list|add|show|seed|close|report
+                        P9: леджер открытых вопросов (prior с вероятностями)
   bench                    smoke-бенчмарк (3 задачи)
   eval --evals <file>       GAIA-lite / GAIA-L1 subset
   fusion \"задача\" --workers N
@@ -1786,6 +1793,219 @@ fn make_starter_skills(sdir: &std::path::Path) -> usize {
         }
     }
     n
+}
+
+
+// ───────────────────────────── P9: idle inference ─────────────────────────────
+// Спека: _gh/ARGUS-OS1/docs/ARGUS_Internal_Process_Idle_Inference_2026-11-12.md
+// M1: леджер + выбор вопроса + запись цикла. Проб нет: инструменты появятся в M2.
+
+fn arg_num(args: &[String], key: &str) -> Option<u64> {
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+}
+
+fn cmd_think(args: &[String], sdir: &PathBuf) {
+    let dry = args.iter().any(|a| a == "--dry-run") || !args.iter().any(|a| a == "--once");
+    let seed = arg_num(args, "--seed").unwrap_or(42);
+    let k = arg_num(args, "--k").unwrap_or(3) as usize;
+
+    if args.iter().any(|a| a == "--report") {
+        print_idle_report(sdir);
+        return;
+    }
+
+    let mut led = Ledger::load(sdir);
+    if led.questions.is_empty() {
+        println!(
+            "леджер пуст: `argus-agent ledger seed` (5 вопросов ARGUS-OS1) или `ledger add \"...\"`"
+        );
+        return;
+    }
+
+    let now = chrono::Utc::now();
+    let ranked = led.ranked(now);
+    if ranked.is_empty() {
+        println!("нет открытых вопросов (все закрыты/заблокированы) — цикл останавливается");
+        return;
+    }
+    println!("пул (seed={seed}, k={k}):");
+    for (i, s) in ranked.iter().take(k).enumerate() {
+        println!(
+            "  {}. {} score={:.3} surprise={:.3} staleness={:.1}ч cost={:.2}\n     {}",
+            i + 1,
+            s.id,
+            s.score,
+            s.surprise,
+            s.staleness_h,
+            s.cost,
+            s.text
+        );
+    }
+
+    let pick = match led.select_next(seed, k) {
+        Some(p) => p,
+        None => {
+            println!("выбор не состоялся");
+            return;
+        }
+    };
+    println!("\nвыбран: {} (seed={seed})", pick.id);
+    println!("  фильтр: вопрос + recall по памяти (M1: recall не подключается)");
+    println!("  проба: M1 не выполняет инструментов (M2: web.search/http.get/file.read)");
+
+    if dry {
+        println!("\n--dry-run: ничего не записано. Записать цикл: --once");
+        return;
+    }
+
+    match led.apply(
+        &pick.id,
+        Outcome::None,
+        "none (M1: проба не выполнялась)",
+        vec![],
+        "M1: цикл выбора без инструментов",
+        0,
+    ) {
+        Some(c) => {
+            let _ = led.save(sdir);
+            let _ = led.append_cycle(sdir, &c);
+            println!(
+                "\nзаписан цикл: {} {} → {} ({:?}); probes={}",
+                c.qid, c.before, c.after, c.verifier,
+                led.get(&pick.id).map(|q| q.probes).unwrap_or(0)
+            );
+            print_idle_report(sdir);
+        }
+        None => println!("вопрос исчез из леджера"),
+    }
+}
+
+fn print_idle_report(sdir: &PathBuf) {
+    let led = Ledger::load(sdir);
+    let m = led.metrics();
+    let verdict = if ledger::gate_failed(&m) {
+        "❌ ГЕЙТ ПРОВАЛЕН (выдуманные ID или резолв < 0.7) → цикл в --dry-run"
+    } else if m.cycles < 5 {
+        "⏳ данных мало (<5 циклов) — гейт не применяется"
+    } else {
+        "✅ гейт пройден"
+    };
+    println!("\n── метрики idle-цикла ──");
+    println!("циклов: {}\n  resolved {} · unresolved {} · fabricated {}", m.cycles, m.resolved, m.unresolved, m.fabricated);
+    println!("identifier_resolution_rate: {:.2}", m.identifier_resolution_rate);
+    println!("fabricated_identifiers:     {}", m.fabricated_identifiers);
+    println!("refutation_share:           {:.2}", m.refutation_share);
+    println!("mean_abs_logit_shift:       {:.3}", m.mean_abs_logit_shift);
+    println!("gaps_recorded:              {}", m.gaps_recorded);
+    println!("вердикт: {verdict}");
+}
+
+fn cmd_ledger(args: &[String], sdir: &PathBuf) {
+    let sub = args.get(2).map(String::as_str).unwrap_or("list");
+    let mut led = Ledger::load(sdir);
+    match sub {
+        "list" => {
+            if led.questions.is_empty() {
+                println!("леджер пуст: ledger seed | ledger add \"вопрос\"");
+                return;
+            }
+            println!("{:<12} {:>6} {:>3}  {:<10} {}", "id", "p", "n", "status", "вопрос");
+            let mut qs = led.questions.clone();
+            qs.sort_by(|a, b| a.status_key().cmp(&b.status_key()).then(a.id.cmp(&b.id)));
+            for q in qs {
+                println!(
+                    "{:<12} {:>6.2} {:>3}  {:<10} {}",
+                    q.id,
+                    q.p_true,
+                    q.probes,
+                    q.status_str(),
+                    q.text
+                );
+            }
+        }
+        "add" => {
+            let text = args.get(3).cloned().unwrap_or_default();
+            if text.trim().is_empty() {
+                println!("использование: ledger add \"текст вопроса\" [--p 0.4]");
+                return;
+            }
+            let p = args
+                .iter()
+                .position(|a| a == "--p")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse::<f64>().ok());
+            let id = led.add(&text, p);
+            let _ = led.save(sdir);
+            println!("✅ добавлен {id}: {text}");
+        }
+        "seed" => {
+            let mut n = 0;
+            for t in ledger::argus_default_questions() {
+                if led.get(&ledger::qid(t)).is_some() {
+                    continue;
+                }
+                led.add(t, None);
+                n += 1;
+            }
+            let _ = led.save(sdir);
+            println!("✅ засеяно вопросов: {n} (всего {})", led.questions.len());
+        }
+        "show" => {
+            let id = match args.get(3) {
+                Some(v) => v.clone(),
+                None => {
+                    println!("использование: ledger show <id>");
+                    return;
+                }
+            };
+            match led.get(&id) {
+                Some(q) => {
+                    println!("{}\n  {}", q.id, q.text);
+                    println!("  p={:.3} (prev {:.3}) status={} probes={}", q.p_true, q.p_prev, q.status_str(), q.probes);
+                    println!("  identifiers: {:?}", q.identifiers);
+                    println!("  gaps: {:?}", q.gaps);
+                    println!("  refutations: {:?}", q.refutations);
+                    let hist: Vec<_> = led.cycles.iter().filter(|c| c.qid == id).collect();
+                    for c in hist {
+                        println!("  · {} {:?} {} → {} ({})", c.at, c.verifier, c.before, c.after, c.note);
+                    }
+                }
+                None => println!("нет такого вопроса: {id}"),
+            }
+        }
+        "close" => {
+            let id = args.get(3).cloned().unwrap_or_default();
+            let how = args.get(4).map(String::as_str).unwrap_or("gap");
+            let (outcome, note) = match how {
+                "refuted" => (Outcome::Contradict, "закрыт человеком: опровергнут".to_string()),
+                "supported" => (Outcome::Support, "закрыт человеком: подтверждён".to_string()),
+                _ => (Outcome::None, "закрыт человеком: пробел (ответа нет)".to_string()),
+            };
+            let ids: Vec<String> = args
+                .iter()
+                .filter(|a| a.starts_with("PMID:") || a.starts_with("doi:") || a.starts_with("arXiv:"))
+                .cloned()
+                .collect();
+            match led.apply(&id, outcome, "human", ids, &note, 0) {
+                Some(c) => {
+                    if how != "refuted" && how != "supported" {
+                        if let Some(q) = led.questions.iter_mut().find(|q| q.id == id) {
+                            q.status = ledger::QStatus::Gap;
+                        }
+                    }
+                    let _ = led.save(sdir);
+                    let _ = led.append_cycle(sdir, &c);
+                    println!("✅ {id} закрыт как «{how}»");
+                }
+                None => println!("нет такого вопроса: {id}"),
+            }
+        }
+        "report" => print_idle_report(sdir),
+        _ => println!("ledger list | add \"...\" [--p 0.5] | show <id> | seed | close <id> gap|refuted|supported | report"),
+    }
 }
 
 fn cmd_memory(args: &[String], sdir: &std::path::Path) {

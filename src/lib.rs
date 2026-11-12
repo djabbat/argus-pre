@@ -2,6 +2,7 @@
 pub mod agent;
 pub mod browser;
 pub mod effects;
+pub mod ledger;
 pub mod mcp;
 pub mod memory;
 pub mod plugins;
