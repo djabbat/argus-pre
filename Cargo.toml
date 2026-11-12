@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "argus-agent"
 path = "src/bin/argus_agent.rs"
 
+[[bin]]
+name = "argus-cka"
+path = "src/bin/argus_cka.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

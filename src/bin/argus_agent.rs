@@ -2,6 +2,8 @@
 //! Паттерны: P1 (цикл + реальная LLM), P2 (файловая память), P4 (режимы-сессия).
 use argus_pre::agent::{AgentLoop, LlmConfig, LlmModel, LoopConfig, Mode, StubModel};
 use argus_pre::ledger::{self, Ledger, Outcome};
+use argus_pre::probe::{self, CorpusSearcher, EpMcSearcher, Searcher};
+use argus_pre::verify::{self, Cache, HttpFetcher};
 use argus_pre::memory::{Memory, NoteKind};
 use std::path::PathBuf;
 
@@ -59,8 +61,15 @@ fn main() {
                         durable side-effect очередь (P8d): notify/report/external/command/outbox/internal
   ticket list/show          P8a: единицы авторизованной работы (Ticket+Mandate)
   policy show/set           P8a: версионированные правила допуска (accept mode off/observe/auto)
-  think [--once|--dry-run] [--seed N] [--k N] [--report]
-                        P9: внутренний цикл (idle inference) — выбрать вопрос из леджера
+  think [--once|--loop|--dry-run] [--probe epmc|corpus|none] [--corpus DIR]
+        [--limit N] [--min-score 0.20] [--offline] [--judge support|contradict]
+        [--qid <id>] [--seed N] [--k N]
+        [--loop --max-cycles N --interval-secs N --budget-cycles N --budget-tokens N --quiet]
+        [--report [--write] [--hours N]]
+                        P9: внутренний цикл (idle inference): выбор вопроса → проба →
+                        резолв PMID/DOI/arXiv → запись цикла + суточный отчёт
+  (отдельный бинарник) argus-cka --corpus DIR [--a ngram] [--b wordhash|ratings:<model>]
+                        [--n N] [--perms N] — M3: сходимость семантики (CKA + перестановочный нуль)
   ledger list|add|show|seed|close|report
                         P9: леджер открытых вопросов (prior с вероятностями)
   bench                    smoke-бенчмарк (3 задачи)
@@ -1807,80 +1816,400 @@ fn arg_num(args: &[String], key: &str) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
-fn cmd_think(args: &[String], sdir: &PathBuf) {
-    let dry = args.iter().any(|a| a == "--dry-run") || !args.iter().any(|a| a == "--once");
-    let seed = arg_num(args, "--seed").unwrap_or(42);
-    let k = arg_num(args, "--k").unwrap_or(3) as usize;
+fn arg_str(args: &[String], key: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
 
+struct ThinkCfg {
+    dry: bool,
+    seed: u64,
+    k: usize,
+    limit: usize,
+    channel: String,
+    offline: bool,
+    judge: Option<String>,
+    corpus: PathBuf,
+    qid: Option<String>,
+    min_cos: f32,
+    quiet: bool,
+    budget_cycles: u32,
+    budget_tokens: u64,
+    interval_secs: u64,
+}
+
+fn parse_think_cfg(args: &[String], sdir: &PathBuf) -> ThinkCfg {
+    ThinkCfg {
+        dry: args.iter().any(|a| a == "--dry-run") || !args.iter().any(|a| a == "--once" || a == "--loop"),
+        seed: arg_num(args, "--seed").unwrap_or(42),
+        k: arg_num(args, "--k").unwrap_or(3) as usize,
+        limit: arg_num(args, "--limit").unwrap_or(3) as usize,
+        channel: arg_str(args, "--probe").unwrap_or_else(|| "none".to_string()),
+        offline: args.iter().any(|a| a == "--offline"),
+        judge: arg_str(args, "--judge"),
+        corpus: arg_str(args, "--corpus")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| sdir.join("corpus")),
+        qid: arg_str(args, "--qid"),
+        min_cos: arg_str(args, "--min-score")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.20),
+        quiet: args.iter().any(|a| a == "--quiet"),
+        budget_cycles: arg_num(args, "--budget-cycles")
+            .unwrap_or(argus_pre::budget::DEFAULT_MAX_CYCLES_PER_HOUR as u64) as u32,
+        budget_tokens: arg_num(args, "--budget-tokens")
+            .unwrap_or(argus_pre::budget::DEFAULT_MAX_TOKENS_PER_DAY),
+        interval_secs: arg_num(args, "--interval-secs").unwrap_or(300),
+    }
+}
+
+fn select_question(cfg: &ThinkCfg, led: &Ledger) -> Result<ledger::Scored, String> {
+    if let Some(id) = &cfg.qid {
+        let q = led.get(id).ok_or_else(|| format!("нет такого вопроса: {id}"))?;
+        return Ok(ledger::Scored {
+            id: q.id.clone(),
+            text: q.text.clone(),
+            score: f64::NAN,
+            surprise: (ledger::logit(q.p_true) - ledger::logit(q.p_prev)).abs(),
+            staleness_h: 0.0,
+            cost: 1.0,
+        });
+    }
+    led.select_next(cfg.seed, cfg.k)
+        .ok_or_else(|| "нет открытых вопросов (все закрыты/заблокированы)".to_string())
+}
+
+/// Один цикл: выбор вопроса → проба → резолв → запись. Возвращает (qid, note, tokens).
+fn run_cycle(
+    cfg: &ThinkCfg,
+    sdir: &PathBuf,
+    led: &mut Ledger,
+    cache: &mut Cache,
+    fetch: &HttpFetcher,
+) -> Result<(String, String, u64), String> {
+    let pick = select_question(cfg, led)?;
+    let q = probe::build_query_for(&cfg.channel, &pick.text);
+    if !cfg.quiet {
+        println!(
+            "\nвопрос: {} (seed={}) — {}",
+            pick.id, cfg.seed, pick.text
+        );
+        println!("  канал: {} · запрос: «{}»", cfg.channel, q);
+    }
+
+    let (outcome, ids, note) = match cfg.channel.as_str() {
+        "epmc" | "corpus" => {
+            let found = if cfg.channel == "epmc" {
+                EpMcSearcher::new(cfg.offline).search(&q, cfg.limit)
+            } else {
+                CorpusSearcher::new(&cfg.corpus).search(&q, cfg.limit)
+            };
+            match found {
+                Err(e) => (
+                    Outcome::None,
+                    vec![],
+                    format!("проба не удалась ({}): {e}", cfg.channel),
+                ),
+                Ok(cands) if cands.is_empty() => (
+                    Outcome::None,
+                    vec![],
+                    format!("{}: 0 попаданий по «{q}»", cfg.channel),
+                ),
+                Ok(cands0) => {
+                    let total = cands0.len();
+                    // M3: семантика (word-level эмбеддинги) вместо грубого совпадения термов
+                    let (cands, dropped_v) = if cfg.channel == "epmc" {
+                        probe::filter_relevant_scored(&q, cands0, cfg.min_cos)
+                    } else {
+                        (cands0, vec![])
+                    };
+                    if !cfg.quiet {
+                        for (c, cos) in &dropped_v {
+                            println!("    {} отсеян (score={cos:.3}) — {}", c.id, c.title);
+                        }
+                    }
+                    let dropped = dropped_v.len();
+                    if cands.is_empty() {
+                        (
+                            Outcome::None,
+                            vec![],
+                            format!(
+                                "{}: найдено {total}, после семантического фильтра 0 (отсеяно {dropped})",
+                                cfg.channel
+                            ),
+                        )
+                    } else {
+                        let parsed: Vec<verify::Id> = cands
+                            .iter()
+                            .filter_map(|c| verify::Id::parse(&c.id))
+                            .collect();
+                        let entries = verify::resolve_many(&parsed, cache, fetch);
+                        if !cfg.quiet {
+                            for (c, e) in cands.iter().zip(entries.iter()) {
+                                let meta = e
+                                    .meta
+                                    .as_ref()
+                                    .map(|m| {
+                                        let y = m.year.map(|y| y.to_string()).unwrap_or_default();
+                                        format!("{} {} · {}", m.container, y, m.title)
+                                    })
+                                    .unwrap_or_else(|| e.err.clone().unwrap_or_default());
+                                println!("    {} {:?} — {}", c.id, e.status, meta);
+                            }
+                        }
+                        let verdict = verify::to_ledger_verifier(&entries);
+                        let resolved: Vec<String> = entries
+                            .iter()
+                            .filter(|e| e.status == verify::Status::Resolved)
+                            .map(|e| e.id.clone())
+                            .collect();
+                        let bad: Vec<String> = entries
+                            .iter()
+                            .filter(|e| e.status == verify::Status::NotFound)
+                            .map(|e| e.id.clone())
+                            .collect();
+                        let note = format!(
+                            "{}: найдено {total}, релевантных {} (отсеяно {dropped}), резолвнуто {} ({verdict:?})",
+                            cfg.channel,
+                            cands.len(),
+                            resolved.len()
+                        );
+                        let outcome = match verdict {
+                            ledger::VerifyResult::Fabricated => Outcome::Fabricated,
+                            ledger::VerifyResult::Resolved => match cfg.judge.as_deref() {
+                                Some("support") => Outcome::Support,
+                                Some("contradict") => Outcome::Contradict,
+                                _ => Outcome::Evidence,
+                            },
+                            ledger::VerifyResult::Unresolved => Outcome::None,
+                        };
+                        let ids_out = if verdict == ledger::VerifyResult::Fabricated {
+                            bad
+                        } else {
+                            resolved
+                        };
+                        (outcome, ids_out, note)
+                    }
+                }
+            }
+        }
+        _ => (
+            Outcome::None,
+            vec![],
+            "канал пробы не выбран (--probe epmc|corpus)".to_string(),
+        ),
+    };
+
+    let cycle = led
+        .apply(&pick.id, outcome, &format!("probe:{}", cfg.channel), ids, &note, 0)
+        .ok_or_else(|| "вопрос исчез из леджера".to_string())?;
+    let _ = led.save(sdir);
+    let _ = led.append_cycle(sdir, &cycle);
+    if let Err(e) = cache.save() {
+        eprintln!("⚠️ кэш verify не сохранён: {e}");
+    }
+    if !cfg.quiet {
+        println!(
+            "  цикл: {:.3} → {:.3} ({:?}); probes={}",
+            cycle.before,
+            cycle.after,
+            cycle.verifier,
+            led.get(&pick.id).map(|q| q.probes).unwrap_or(0)
+        );
+        println!("  {note}");
+    }
+    Ok((pick.id.clone(), note, 0))
+}
+
+fn cmd_think(args: &[String], sdir: &PathBuf) {
     if args.iter().any(|a| a == "--report") {
         print_idle_report(sdir);
+        if args.iter().any(|a| a == "--write") {
+            let hours = arg_str(args, "--hours").and_then(|v| v.parse::<f64>().ok());
+            match write_daily_report(sdir, hours) {
+                Ok(p) => println!("\n📄 отчёт записан: {}", p.display()),
+                Err(e) => println!("⚠️ отчёт не записан: {e}"),
+            }
+        }
         return;
     }
 
+    let cfg = parse_think_cfg(args, sdir);
     let mut led = Ledger::load(sdir);
     if led.questions.is_empty() {
-        println!(
-            "леджер пуст: `argus-agent ledger seed` (5 вопросов ARGUS-OS1) или `ledger add \"...\"`"
-        );
+        println!("леджер пуст: `argus-agent ledger seed` (5 вопросов ARGUS-OS1) или `ledger add \"...\"`");
         return;
     }
 
-    let now = chrono::Utc::now();
-    let ranked = led.ranked(now);
-    if ranked.is_empty() {
-        println!("нет открытых вопросов (все закрыты/заблокированы) — цикл останавливается");
-        return;
-    }
-    println!("пул (seed={seed}, k={k}):");
-    for (i, s) in ranked.iter().take(k).enumerate() {
-        println!(
-            "  {}. {} score={:.3} surprise={:.3} staleness={:.1}ч cost={:.2}\n     {}",
-            i + 1,
-            s.id,
-            s.score,
-            s.surprise,
-            s.staleness_h,
-            s.cost,
-            s.text
-        );
-    }
-
-    let pick = match led.select_next(seed, k) {
-        Some(p) => p,
-        None => {
-            println!("выбор не состоялся");
-            return;
-        }
-    };
-    println!("\nвыбран: {} (seed={seed})", pick.id);
-    println!("  фильтр: вопрос + recall по памяти (M1: recall не подключается)");
-    println!("  проба: M1 не выполняет инструментов (M2: web.search/http.get/file.read)");
-
-    if dry {
-        println!("\n--dry-run: ничего не записано. Записать цикл: --once");
-        return;
-    }
-
-    match led.apply(
-        &pick.id,
-        Outcome::None,
-        "none (M1: проба не выполнялась)",
-        vec![],
-        "M1: цикл выбора без инструментов",
-        0,
-    ) {
-        Some(c) => {
-            let _ = led.save(sdir);
-            let _ = led.append_cycle(sdir, &c);
+    // план: пул + выбранный вопрос, без записи
+    if cfg.dry {
+        let ranked = led.ranked(chrono::Utc::now());
+        println!("пул (seed={}, k={}):", cfg.seed, cfg.k);
+        for (i, s) in ranked.iter().take(cfg.k).enumerate() {
             println!(
-                "\nзаписан цикл: {} {} → {} ({:?}); probes={}",
-                c.qid, c.before, c.after, c.verifier,
-                led.get(&pick.id).map(|q| q.probes).unwrap_or(0)
+                "  {}. {} score={:.3} surprise={:.3} staleness={:.1}ч cost={:.2}\n     {}",
+                i + 1,
+                s.id,
+                s.score,
+                s.surprise,
+                s.staleness_h,
+                s.cost,
+                s.text
             );
-            print_idle_report(sdir);
         }
-        None => println!("вопрос исчез из леджера"),
+        match select_question(&cfg, &led) {
+            Ok(p) => {
+                let q = probe::build_query_for(&cfg.channel, &p.text);
+                println!("\nвыбран: {} · канал {} · запрос «{}»", p.id, cfg.channel, q);
+                println!("--dry-run: ничего не записано. Записать: --once; фон: --loop");
+            }
+            Err(e) => println!("{e}"),
+        }
+        return;
     }
+
+    let mut cache = Cache::load(sdir);
+    let fetch = HttpFetcher::new(cfg.offline);
+    let mut budget = argus_pre::budget::Budget::load(sdir);
+    budget.max_cycles_per_hour = cfg.budget_cycles;
+    budget.max_tokens_per_day = cfg.budget_tokens;
+
+    if !args.iter().any(|a| a == "--loop") {
+        match run_cycle(&cfg, sdir, &mut led, &mut cache, &fetch) {
+            Ok((_qid, _note, tokens)) => {
+                budget.record(chrono::Utc::now(), tokens);
+                let _ = budget.save();
+                print_idle_report(sdir);
+            }
+            Err(e) => println!("{e}"),
+        }
+        return;
+    }
+
+    // ── M3: непрерывный цикл с бюджетом ─────────────────────────────────────
+    let max_cycles = arg_num(args, "--max-cycles");
+    let interval = std::time::Duration::from_secs(cfg.interval_secs.max(10));
+    println!(
+        "idle-loop: бюджет {} циклов/ч · {} токенов/сутки · интервал {}с · channel={}",
+        cfg.budget_cycles, cfg.budget_tokens, cfg.interval_secs, cfg.channel
+    );
+    let mut done: u64 = 0;
+    loop {
+        let now = chrono::Utc::now();
+        if let Err(why) = budget.gate(now) {
+            println!("⏸ {why} — цикл остановлен");
+            break;
+        }
+        match run_cycle(&cfg, sdir, &mut led, &mut cache, &fetch) {
+            Ok((qid, _note, tokens)) => {
+                budget.record(chrono::Utc::now(), tokens);
+                let _ = budget.save();
+                done += 1;
+                if let Ok(p) = write_daily_report(sdir, None) {
+                    println!("  📄 {qid} → {}", p.display());
+                }
+            }
+            Err(e) => {
+                println!("⚠️ {e}");
+                if e.contains("нет открытых вопросов") {
+                    break;
+                }
+            }
+        }
+        if let Some(m) = max_cycles {
+            if done >= m {
+                println!("остановка по --max-cycles {m}");
+                break;
+            }
+        }
+        std::thread::sleep(interval);
+    }
+    println!("\nсделано циклов: {done}");
+    print_idle_report(sdir);
+    if let Ok(p) = write_daily_report(sdir, None) {
+        println!("📄 суточный отчёт: {}", p.display());
+    }
+    if let Ok(p) = write_daily_report(sdir, Some(24.0)) {
+        println!("📄 окно 24 ч: {}", p.display());
+    }
+}
+
+/// Суточный отчёт: метрики, бюджет, состояние леджера, вердикт гейта.
+fn write_daily_report(sdir: &PathBuf, hours: Option<f64>) -> std::io::Result<PathBuf> {
+    use std::fmt::Write as _;
+    let mut led = Ledger::load(sdir);
+    // окно: только циклы за последние N часов (M4: отчёт за сутки)
+    if let Some(h) = hours {
+        let cutoff = chrono::Utc::now() - chrono::Duration::minutes((h * 60.0) as i64);
+        led.cycles.retain(|c| {
+            chrono::DateTime::parse_from_rfc3339(&c.at)
+                .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
+                .unwrap_or(false)
+        });
+    }
+    let m = led.metrics();
+    let mut budget = argus_pre::budget::Budget::load(sdir);
+    let now = chrono::Utc::now();
+    budget.roll_over(now);
+    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let verdict = if ledger::gate_failed(&m) {
+        "❌ ГЕЙТ ПРОВАЛЕН (выдуманные ID или резолв < 0.7) → цикл в --dry-run"
+    } else if m.id_cycles < 5 {
+        "⏳ данных мало (<5 циклов с идентификаторами) — гейт не применяется"
+    } else {
+        "✅ гейт пройден"
+    };
+
+    let mut s = String::new();
+    let _ = writeln!(s, "# idle-report — {day}\n");
+    let _ = writeln!(s, "Сгенерировано: {}", now.to_rfc3339());
+    let _ = writeln!(s, "Вердикт: **{verdict}**\n");
+    let _ = writeln!(s, "## Метрики\n");
+    let _ = writeln!(s, "| метрика | значение |\n|---|---|");
+    let _ = writeln!(s, "| циклов | {} |", m.cycles);
+    let _ = writeln!(s, "| с идентификаторами | {} |", m.id_cycles);
+    let _ = writeln!(s, "| пробелов (ничего не найдено) | {} |", m.gap_cycles);
+    let _ = writeln!(s, "| resolved / unresolved / fabricated | {} / {} / {} |", m.resolved, m.unresolved, m.fabricated);
+    let _ = writeln!(s, "| identifier_resolution_rate | {:.2} |", m.identifier_resolution_rate);
+    let _ = writeln!(s, "| evidence_yield | {:.2} |", m.evidence_yield);
+    let _ = writeln!(s, "| fabricated_identifiers | {} |", m.fabricated_identifiers);
+    let _ = writeln!(s, "| mean_abs_logit_shift | {:.3} |", m.mean_abs_logit_shift);
+    let _ = writeln!(s, "| gaps_recorded | {} |", m.gaps_recorded);
+    let _ = writeln!(s, "\n## Бюджет\n");
+    let _ = writeln!(s, "- циклов за час: {} / {}", budget.recent.len(), budget.max_cycles_per_hour);
+    let _ = writeln!(s, "- циклов за сутки: {}", budget.cycles_today);
+    let _ = writeln!(s, "- токенов за сутки: {} / {}", budget.tokens_today, budget.max_tokens_per_day);
+
+    let _ = writeln!(s, "\n## Леджер\n");
+    let _ = writeln!(s, "| id | p | probes | status | вопрос |\n|---|---|---|---|---|");
+    let mut qs = led.questions.clone();
+    qs.sort_by(|a, b| a.status_key().cmp(&b.status_key()).then(a.id.cmp(&b.id)));
+    for q in qs {
+        let text: String = q.text.chars().take(90).collect();
+        let _ = writeln!(s, "| {} | {:.2} | {} | {} | {} |", q.id, q.p_true, q.probes, q.status_str(), text.replace('|', "/"));
+    }
+
+    let _ = writeln!(s, "\n## Последние циклы\n");
+    let _ = writeln!(s, "| когда | вопрос | вердикт | p до → после | что нашли |\n|---|---|---|---|---|");
+    for c in led.cycles.iter().rev().take(15) {
+        let _ = writeln!(
+            s,
+            "| {} | {} | {:?} | {:.3} → {:.3} | {} |",
+            c.at, c.qid, c.verifier, c.before, c.after, c.note.replace('|', "/")
+        );
+    }
+
+    let name = match hours {
+        Some(h) => format!("report_{:.0}h_{day}.md", h),
+        None => format!("report_{day}.md"),
+    };
+    let path = sdir.join("ledger").join(name);
+    std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))?;
+    std::fs::write(&path, s)?;
+    Ok(path)
 }
 
 fn print_idle_report(sdir: &PathBuf) {
@@ -1888,14 +2217,22 @@ fn print_idle_report(sdir: &PathBuf) {
     let m = led.metrics();
     let verdict = if ledger::gate_failed(&m) {
         "❌ ГЕЙТ ПРОВАЛЕН (выдуманные ID или резолв < 0.7) → цикл в --dry-run"
-    } else if m.cycles < 5 {
-        "⏳ данных мало (<5 циклов) — гейт не применяется"
+    } else if m.id_cycles < 5 {
+        "⏳ данных мало (<5 циклов с идентификаторами) — гейт не применяется"
     } else {
         "✅ гейт пройден"
     };
     println!("\n── метрики idle-цикла ──");
-    println!("циклов: {}\n  resolved {} · unresolved {} · fabricated {}", m.cycles, m.resolved, m.unresolved, m.fabricated);
-    println!("identifier_resolution_rate: {:.2}", m.identifier_resolution_rate);
+    println!(
+        "циклов: {} (с идентификаторами {} · пробелов {})",
+        m.cycles, m.id_cycles, m.gap_cycles
+    );
+    println!(
+        "  resolved {} · unresolved {} · fabricated {}",
+        m.resolved, m.unresolved, m.fabricated
+    );
+    println!("identifier_resolution_rate: {:.2} (по циклам с ID, не по всем)", m.identifier_resolution_rate);
+    println!("evidence_yield:             {:.2} (доля циклов, давших хоть один ID)", m.evidence_yield);
     println!("fabricated_identifiers:     {}", m.fabricated_identifiers);
     println!("refutation_share:           {:.2}", m.refutation_share);
     println!("mean_abs_logit_shift:       {:.3}", m.mean_abs_logit_shift);

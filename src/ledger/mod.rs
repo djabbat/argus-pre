@@ -62,6 +62,9 @@ pub enum Outcome {
     None,
     /// выдуманный идентификатор
     Fabricated,
+    /// найдено свидетельство, но пригодность его к вопросу НЕ оценена (M2: проба без суждения).
+    /// Идентификаторы записываются, вероятность НЕ двигается — иначе агент набирает уверенность из шума.
+    Evidence,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -480,6 +483,18 @@ impl Ledger {
                 q.gaps.push(note.to_string());
                 (VerifyResult::Unresolved, before)
             }
+            Outcome::Evidence => {
+                if identifiers.is_empty() {
+                    (VerifyResult::Unresolved, before)
+                } else {
+                    for i in &identifiers {
+                        if !q.identifiers.contains(i) {
+                            q.identifiers.push(i.clone());
+                        }
+                    }
+                    (VerifyResult::Resolved, before)
+                }
+            }
             Outcome::Support | Outcome::Contradict => {
                 if identifiers.is_empty() {
                     // свидетельство без идентификатора не засчитывается
@@ -536,10 +551,17 @@ impl Ledger {
 #[derive(Debug, Clone, Default)]
 pub struct Metrics {
     pub cycles: usize,
+    /// циклы, в которых заявлялся хотя бы один идентификатор (только по ним считается резолв)
+    pub id_cycles: usize,
+    /// циклы без идентификаторов: честный «пробел» (поиск ничего не дал)
+    pub gap_cycles: usize,
     pub resolved: usize,
     pub unresolved: usize,
     pub fabricated: usize,
+    /// resolved / id_cycles — НЕ по всем циклам: иначе «ничего не нашёл» выглядит как провал резолва
     pub identifier_resolution_rate: f64,
+    /// доля циклов, давших хоть один идентификатор: отдельная метрика выхода, не гейт
+    pub evidence_yield: f64,
     pub fabricated_identifiers: usize,
     pub refutation_share: f64,
     pub mean_abs_logit_shift: f64,
@@ -553,35 +575,39 @@ pub fn metrics(cycles: &[Cycle]) -> Metrics {
     };
     let mut shifts = Vec::new();
     for c in cycles {
-        match c.verifier {
-            VerifyResult::Resolved => m.resolved += 1,
-            VerifyResult::Unresolved => m.unresolved += 1,
-            VerifyResult::Fabricated => {
-                m.fabricated += 1;
-                m.fabricated_identifiers += c.identifiers.len().max(1);
+        if c.verifier == VerifyResult::Fabricated {
+            m.fabricated += 1;
+            m.fabricated_identifiers += c.identifiers.len().max(1);
+        } else if !c.identifiers.is_empty() {
+            m.id_cycles += 1;
+            match c.verifier {
+                VerifyResult::Resolved => m.resolved += 1,
+                VerifyResult::Unresolved => m.unresolved += 1,
+                VerifyResult::Fabricated => {}
             }
+        } else {
+            m.gap_cycles += 1;
+            m.gaps_recorded += 1;
         }
         if (c.after - c.before).abs() > f64::EPSILON {
             shifts.push((logit(c.after) - logit(c.before)).abs());
         }
-        if c.verifier == VerifyResult::Unresolved && c.note.contains("[no identifier]") {
-            m.gaps_recorded += 1;
-        }
     }
-    let claimed = m.resolved + m.unresolved + m.fabricated;
-    m.identifier_resolution_rate = if claimed == 0 {
+    m.identifier_resolution_rate = if m.id_cycles == 0 {
         0.0
     } else {
-        m.resolved as f64 / claimed as f64
+        m.resolved as f64 / m.id_cycles as f64
     };
-    let closed = cycles
-        .iter()
-        .filter(|c| c.after <= P_CLOSE_REFUTE)
-        .count();
-    m.refutation_share = if claimed == 0 {
+    m.evidence_yield = if m.cycles == 0 {
         0.0
     } else {
-        closed as f64 / claimed as f64
+        m.id_cycles as f64 / m.cycles as f64
+    };
+    let closed = cycles.iter().filter(|c| c.after <= P_CLOSE_REFUTE).count();
+    m.refutation_share = if m.id_cycles == 0 {
+        0.0
+    } else {
+        closed as f64 / m.id_cycles as f64
     };
     m.mean_abs_logit_shift = if shifts.is_empty() {
         0.0
@@ -593,7 +619,7 @@ pub fn metrics(cycles: &[Cycle]) -> Metrics {
 
 /// Гейт спеки §6: провал, если есть выдуманные идентификаторы или резолв ниже порога.
 pub fn gate_failed(m: &Metrics) -> bool {
-    m.fabricated_identifiers > 0 || (m.cycles >= 5 && m.identifier_resolution_rate < 0.7)
+    m.fabricated_identifiers > 0 || (m.id_cycles >= 5 && m.identifier_resolution_rate < 0.7)
 }
 
 /// Реальные открытые вопросы ARGUS-OS1 для засева (не выдуманные: из STATE/TODO/TRD).

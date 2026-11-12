@@ -846,12 +846,17 @@ fn kind_name(k: &NoteKind) -> &'static str {
 /// V2.4: эмбеддинг через Ollama /api/embed (если сервер с --embeddings).
 /// Возвращает None, если сервер не поддерживает или недоступен.
 pub fn ollama_embed(text: &str) -> Option<Vec<f32>> {
+    ollama_embed_model(text, "qwen2.5:7b")
+}
+
+/// M3: эмбеддинг конкретной модели (для проверки сходимости gemma vs qwen).
+pub fn ollama_embed_model(text: &str, model: &str) -> Option<Vec<f32>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
     let url = std::env::var("ARGUS_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
-    let body = serde_json::json!({ "model": "qwen2.5:7b", "input": text });
+    let body = serde_json::json!({ "model": model, "input": text });
     let resp = client
         .post(format!("{url}/api/embed"))
         .json(&body)
