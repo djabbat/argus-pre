@@ -2133,31 +2133,73 @@ fn cmd_think(args: &[String], sdir: &PathBuf) {
     };
     let max_cycles = arg_num(args, "--max-cycles");
     let interval = std::time::Duration::from_secs(cfg.interval_secs.max(10));
+
+    // ── подъём после выключения/сна: продолжаем с момента остановки ──────────
+    // Gap-вопросы живут не вечно: через сутки возвращаем их в очередь
+    if led.reopen_stale_gaps(chrono::Utc::now(), 6) > 0 {
+        let _ = led.save(sdir);
+        println!("♻️ часть Gap-вопросов переоткрыта (прошло > 6 ч)");
+    }
+    let mut runtime = argus_pre::resume::Runtime::load(sdir);
+    let plan = argus_pre::resume::plan_catchup(
+        runtime.last_tick.as_deref(),
+        cfg.interval_secs,
+        budget.hour_remaining(chrono::Utc::now()),
+        argus_pre::resume::MAX_CATCHUP_CYCLES,
+    );
+    let mut to_catchup = plan.0;
+    if let Some(note) = argus_pre::resume::resume_note(plan) {
+        runtime.resumes += 1;
+        runtime.downtime_secs += plan.2;
+        println!("⏯ {note}");
+    }
+    runtime.tick();
+    let _ = runtime.save();
     println!(
         "idle-loop: бюджет {} циклов/ч · {} токенов/сутки · интервал {}с · channel={}",
         cfg.budget_cycles, cfg.budget_tokens, cfg.interval_secs, cfg.channel
     );
     let mut done: u64 = 0;
     loop {
+        // сервис живёт часами: подхватываем изменения леджера, сделанные снаружи
+        led = Ledger::load(sdir);
         let now = chrono::Utc::now();
         if let Err(why) = budget.gate(now) {
-            println!("⏸ {why} — цикл остановлен");
-            break;
+            if max_cycles.is_some() {
+                println!("⏸ {why} — цикл остановлен");
+                break;
+            }
+            // как сервис: не выходим, а ждём следующего окна бюджета (иначе systemd
+            // перезапускает нас каждые 20 с и мы просто жжём циклы вхолостую)
+            println!("⏸ {why} — ждём окно бюджета ({} с)", cfg.interval_secs.max(10));
+            std::thread::sleep(interval);
+            continue;
         }
         match run_cycle(&cfg, sdir, &mut led, &mut cache, &fetch) {
             Ok((qid, _note, tokens)) => {
                 budget.record(chrono::Utc::now(), tokens);
                 let _ = budget.save();
                 done += 1;
+                if to_catchup > 0 {
+                    to_catchup -= 1;
+                    runtime.catchup_cycles += 1;
+                }
+                runtime.tick();
+                let _ = runtime.save();
                 if let Ok(p) = write_daily_report(sdir, None) {
                     println!("  📄 {qid} → {}", p.display());
                 }
             }
             Err(e) => {
                 println!("⚠️ {e}");
-                if e.contains("нет открытых вопросов") {
+                if max_cycles.is_some() {
                     break;
                 }
+                // как сервис: не умираем, если очередь опустела — ждём и пробуем снова
+                // (Gap-вопросы переоткрываются через 24 ч, см. reopen_stale_gaps)
+                println!("   ждём {} с и пробуем снова", cfg.interval_secs.max(10));
+                std::thread::sleep(interval);
+                continue;
             }
         }
         if let Some(m) = max_cycles {
@@ -2165,6 +2207,10 @@ fn cmd_think(args: &[String], sdir: &PathBuf) {
                 println!("остановка по --max-cycles {m}");
                 break;
             }
+        }
+        if to_catchup > 0 {
+            println!("  ⏩ догон: осталось {to_catchup}");
+            continue; // догоняем без паузы
         }
         std::thread::sleep(interval);
     }
@@ -2403,8 +2449,22 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
                 None => println!("нет такого вопроса: {id}"),
             }
         }
+        "reopen" => {
+            let what = args.get(3).cloned().unwrap_or_else(|| "all".to_string());
+            let mut n = 0;
+            for q in led.questions.iter_mut() {
+                if (what == "all" || q.id == what) && q.status == ledger::QStatus::Gap {
+                    q.status = ledger::QStatus::Open;
+                    q.consecutive_gaps = 0;
+                    n += 1;
+                    println!("♻️ {} → open", q.id);
+                }
+            }
+            let _ = led.save(sdir);
+            println!("переоткрыто: {n}");
+        }
         "report" => print_idle_report(sdir),
-        _ => println!("ledger list | add \"...\" [--p 0.5] [--kind lit|lab] | show <id> | seed | set-kind <id> lit|lab | close <id> gap|refuted|supported | report"),
+        _ => println!("ledger list | add \"...\" [--p 0.5] [--kind lit|lab] | show <id> | seed | set-kind <id> lit|lab | reopen [id|all] | close <id> gap|refuted|supported | report"),
     }
 }
 

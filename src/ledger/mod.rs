@@ -106,6 +106,13 @@ pub struct Question {
     /// сколько проб подряд не дали ни одного идентификатора (защита от «залипания»)
     #[serde(default)]
     pub consecutive_gaps: u32,
+    /// что система ОЖИДАЕТ найти (прогноз); внешнее даёт разницу с этим — а не «смысл»
+    #[serde(default)]
+    pub expected: Option<String>,
+    /// измеренная ошибка предсказания 0..1 на прошлой пробе: |Δlogit|/3 для суждённого
+    /// свидетельства, 0.35 для найденного но не суждённого, 0.1 для «ничего не нашли»
+    #[serde(default)]
+    pub last_error: f32,
 }
 
 fn default_kind() -> QKind {
@@ -132,6 +139,8 @@ impl Question {
             status: QStatus::Open,
             kind: QKind::Lit,
             consecutive_gaps: 0,
+            expected: None,
+            last_error: 0.0,
         }
     }
 
@@ -372,14 +381,14 @@ pub fn score_question_for(q: &Question, now: DateTime<Utc>, lit_channel: bool) -
     if lit_channel && q.kind == QKind::Lab {
         return None;
     }
-    // бонус за пробел ограничен: иначе «чем хуже ищется, тем чаще выбирается» —
-    // положительная обратная связь, которая морит остальные вопросы голодом (найдено 12 ноя)
-    let surprise = (logit(q.p_true) - logit(q.p_prev)).abs()
-        + if q.consecutive_gaps == 0 || q.consecutive_gaps >= MAX_CONSECUTIVE_GAPS {
-            0.0
-        } else {
-            0.5 / q.consecutive_gaps as f64
-        };
+    // Внимание привлекает РАЗНИЦА между прогнозом и реальностью (ошибка предсказания),
+    // а не «сколько раз не нашлось»: провал поиска — это низкая точность канала, а не сигнал.
+    // Затухание: 24 ч после пробы ошибка падает вдвое — иначе одна сенсация держит очередь вечно.
+    let ref_hours = parse_ts(q.last_probed.as_deref().unwrap_or(&q.created))
+        .map(|t| ((now - t).num_seconds().max(0) as f64) / 3600.0)
+        .unwrap_or(0.0);
+    let decay = (-ref_hours / 24.0).exp() as f64;
+    let surprise = (q.last_error as f64) * decay;
     let ref_ts = parse_ts(q.last_probed.as_deref().unwrap_or(&q.created))?;
     let staleness_h = ((now - ref_ts).num_seconds().max(0) as f64) / 3600.0;
     let cost = 1.0 + 0.25 * q.probes as f64;
@@ -536,11 +545,13 @@ impl Ledger {
             Outcome::Fabricated => {
                 q.status = QStatus::Blocked;
                 q.consecutive_gaps = 0;
+                q.last_error = 1.0;
                 (VerifyResult::Fabricated, before)
             }
             Outcome::None => {
                 q.gaps.push(note.to_string());
                 q.consecutive_gaps += 1;
+                q.last_error = 0.1;
                 if q.consecutive_gaps >= MAX_CONSECUTIVE_GAPS {
                     q.status = QStatus::Gap;
                 }
@@ -549,9 +560,11 @@ impl Ledger {
             Outcome::Evidence => {
                 if identifiers.is_empty() {
                     q.consecutive_gaps += 1;
+                    q.last_error = 0.1;
                     (VerifyResult::Unresolved, before)
                 } else {
                     q.consecutive_gaps = 0;
+                    q.last_error = 0.35;
                     for i in &identifiers {
                         if !q.identifiers.contains(i) {
                             q.identifiers.push(i.clone());
@@ -574,6 +587,8 @@ impl Ledger {
                     let p = shift(before, lr);
                     q.p_prev = before;
                     q.p_true = p;
+                    // суждённое свидетельство = реальное обновление веры → его величина и есть ошибка
+                    q.last_error = (((logit(p) - logit(before)).abs() / 3.0) as f32).clamp(0.0, 1.0);
                     for i in &identifiers {
                         if !q.identifiers.contains(i) {
                             q.identifiers.push(i.clone());
@@ -605,6 +620,27 @@ impl Ledger {
         };
         self.cycles.push(cycle.clone());
         Some(cycle)
+    }
+
+    /// Возвращает в очередь вопросы, которые ушли в `Gap`, если с последней пробы прошло
+    /// больше `hours` часов: «не нашлось сегодня» ≠ «не найдётся никогда».
+    pub fn reopen_stale_gaps(&mut self, now: DateTime<Utc>, hours: i64) -> usize {
+        let mut n = 0;
+        for q in self.questions.iter_mut() {
+            if q.status != QStatus::Gap {
+                continue;
+            }
+            let ts = q.last_probed.clone().unwrap_or_else(|| q.created.clone());
+            let old = parse_ts(&ts)
+                .map(|t| (now - t).num_hours() >= hours)
+                .unwrap_or(true);
+            if old {
+                q.status = QStatus::Open;
+                q.consecutive_gaps = 0;
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Метрики по записанным циклам (спека §5).
@@ -873,6 +909,48 @@ mod tests {
         for seed in 0..10 {
             assert_eq!(l.select_next(seed, 3).unwrap().id, good, "seed={seed}");
         }
+    }
+
+    #[test]
+    fn prediction_error_drives_attention() {
+        let mut l = Ledger::default();
+        let revised = l.add("вопрос, по которому пришло свидетельство", None);
+        let empty = l.add("вопрос, по которому пусто", None);
+        // свидетельство → ошибка предсказания высокая
+        l.apply(&revised, Outcome::Support, "probe", vec!["PMID:23663408".into()], "ok", 0);
+        // пустая проба → ошибка низкая (это свойство канала, а не мира)
+        l.apply(&empty, Outcome::None, "probe", vec![], "0 попаданий", 0);
+        assert!(l.get(&revised).unwrap().last_error > l.get(&empty).unwrap().last_error);
+        // порядок в очереди: вопрос с большей ошибкой предсказания идёт первым
+        let ranked = l.ranked(Utc::now());
+        assert_eq!(ranked[0].id, revised, "score={:?}", ranked.iter().map(|r| (r.id.clone(), r.score)).collect::<Vec<_>>());
+        // и выигрывает рулетку в большинстве случаев (не всегда: рулетка взвешена, а не argmax)
+        let picks = (0..20).filter(|s| l.select_next(*s, 2).unwrap().id == revised).count();
+        assert!(picks >= 12, "выбран {picks}/20 раз — вес ошибки слишком слаб");
+    }
+
+    #[test]
+    fn unverified_probe_does_not_raise_error() {
+        let mut l = Ledger::default();
+        let id = l.add("вопрос", None);
+        l.apply(&id, Outcome::None, "probe", vec![], "проба не удалась: offline", 0);
+        assert!(l.get(&id).unwrap().last_error <= 0.1);
+    }
+
+    #[test]
+    fn stale_gaps_are_reopened() {
+        let mut l = Ledger::default();
+        let id = l.add("вопрос", None);
+        for _ in 0..MAX_CONSECUTIVE_GAPS {
+            l.apply(&id, Outcome::None, "p", vec![], "0", 0);
+        }
+        assert_eq!(l.get(&id).unwrap().status, QStatus::Gap);
+        // сразу — не переоткрываем
+        assert_eq!(l.reopen_stale_gaps(Utc::now(), 24), 0);
+        // через 25 часов — переоткрываем
+        assert_eq!(l.reopen_stale_gaps(Utc::now() + chrono::Duration::hours(25), 24), 1);
+        assert_eq!(l.get(&id).unwrap().status, QStatus::Open);
+        assert_eq!(l.get(&id).unwrap().consecutive_gaps, 0);
     }
 
     #[test]

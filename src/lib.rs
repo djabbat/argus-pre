@@ -8,6 +8,7 @@ pub mod ledger;
 pub mod mcp;
 pub mod memory;
 pub mod plugins;
+pub mod resume;
 pub mod probe;
 pub mod skills;
 pub mod tickets;
