@@ -20,6 +20,12 @@ pub const LAMBDA: f64 = 0.5;
 pub const LR_SUPPORT: f64 = 3.0;
 /// Правдоподобие противоречащего свидетельства.
 pub const LR_CONTRA: f64 = 1.0 / 3.0;
+/// Консилиум бесплатных моделей (`crate::dialogue`) — мнение, а не измерение:
+/// сдвиг слабее литературного свидетельства и НЕ может закрыть вопрос.
+pub const LR_COUNCIL_SUPPORT: f64 = 1.5;
+pub const LR_COUNCIL_CONTRADICT: f64 = 1.0 / 1.5;
+/// Не больше одного консилиумного сдвига на вопрос в сутки (защита от «накрутки»).
+pub const COUNCIL_MAX_SHIFTS_PER_DAY: u32 = 1;
 /// Клип вероятности: не бывает 0 и 1 (иначе logit взрывается и вопрос «закрыт навсегда»).
 pub const P_MIN: f64 = 0.02;
 pub const P_MAX: f64 = 0.98;
@@ -53,6 +59,8 @@ pub enum VerifyResult {
     Unresolved,
     /// идентификатор выглядит валидным, но не резолвится — hard fail
     Fabricated,
+    /// свидетельства-идентификатора нет: применён консилиум бесплатных моделей
+    Council,
 }
 
 /// Что принесла проба (только для Resolved).
@@ -64,6 +72,9 @@ pub enum Outcome {
     None,
     /// выдуманный идентификатор
     Fabricated,
+    /// консилиум бесплатных чатов сказал «да»/«нет» — слабый сдвиг приора (не доказательство)
+    CouncilSupport,
+    CouncilContradict,
     /// найдено свидетельство, но пригодность его к вопросу НЕ оценена (M2: проба без суждения).
     /// Идентификаторы записываются, вероятность НЕ двигается — иначе агент набирает уверенность из шума.
     Evidence,
@@ -122,6 +133,12 @@ pub struct Question {
     /// возвращались бы в очередь каждые 6 часов.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// сколько раз консилиум сдвигал вероятность (ограничено в сутки)
+    #[serde(default)]
+    pub council_shifts: u32,
+    /// когда консилиум последний раз сдвигал p (RFC3339)
+    #[serde(default)]
+    pub last_council_at: Option<String>,
 }
 
 fn default_kind() -> QKind {
@@ -152,6 +169,8 @@ impl Question {
             last_error: 0.0,
             form: Some(crate::stance::detect_form(text)),
             superseded_by: None,
+            council_shifts: 0,
+            last_council_at: None,
         }
     }
 
@@ -689,6 +708,42 @@ impl Ledger {
                     (VerifyResult::Resolved, before)
                 }
             }
+            Outcome::CouncilSupport | Outcome::CouncilContradict => {
+                let recent = q
+                    .last_council_at
+                    .as_deref()
+                    .and_then(parse_ts)
+                    .map(|t| (Utc::now() - t).num_hours() < 24)
+                    .unwrap_or(false);
+                if recent {
+                    q.gaps.push(format!(
+                        "{note} [консилиум уже сдвигал p за последние 24 ч — пропуск]"
+                    ));
+                    (VerifyResult::Council, before)
+                } else if !form.allows_lr() {
+                    q.gaps.push(format!(
+                        "{note} [form={}: консилиум не применяется]",
+                        form.as_str()
+                    ));
+                    (VerifyResult::Council, before)
+                } else {
+                    let lr = if outcome == Outcome::CouncilSupport {
+                        LR_COUNCIL_SUPPORT
+                    } else {
+                        LR_COUNCIL_CONTRADICT
+                    };
+                    let p = shift(before, lr);
+                    // консилиум НЕ закрывает вопрос: держим p ниже порога закрытия
+                    let capped = p.min(P_CLOSE_SUPPORT - 0.005).max(P_MIN);
+                    q.p_prev = before;
+                    q.p_true = capped;
+                    q.last_error = (((logit(capped) - logit(before)).abs() / 3.0) as f32)
+                        .clamp(0.0, 1.0);
+                    q.council_shifts += 1;
+                    q.last_council_at = Some(now.clone());
+                    (VerifyResult::Council, capped)
+                }
+            }
             Outcome::Support | Outcome::Contradict => {
                 if identifiers.is_empty() {
                     // свидетельство без идентификатора не засчитывается
@@ -884,6 +939,8 @@ pub struct Metrics {
     pub refutation_share: f64,
     pub mean_abs_logit_shift: f64,
     pub gaps_recorded: usize,
+    /// циклы, где вероятность двигал консилиум бесплатных моделей (не идентификатор)
+    pub council_cycles: usize,
 }
 
 pub fn metrics(cycles: &[Cycle]) -> Metrics {
@@ -893,7 +950,9 @@ pub fn metrics(cycles: &[Cycle]) -> Metrics {
     };
     let mut shifts = Vec::new();
     for c in cycles {
-        if c.verifier == VerifyResult::Fabricated {
+        if c.verifier == VerifyResult::Council {
+            m.council_cycles += 1;
+        } else if c.verifier == VerifyResult::Fabricated {
             m.fabricated += 1;
             m.fabricated_identifiers += c.identifiers.len().max(1);
         } else if !c.identifiers.is_empty() {
@@ -901,7 +960,7 @@ pub fn metrics(cycles: &[Cycle]) -> Metrics {
             match c.verifier {
                 VerifyResult::Resolved => m.resolved += 1,
                 VerifyResult::Unresolved => m.unresolved += 1,
-                VerifyResult::Fabricated => {}
+                VerifyResult::Fabricated | VerifyResult::Council => {}
             }
         } else {
             m.gap_cycles += 1;
@@ -1379,6 +1438,78 @@ mod tests {
         l.close_by_human(&id2, "gap", "не претензия");
         assert_eq!(l.get(&id2).unwrap().status, QStatus::Gap);
         assert!(l.select_next(1, 5).is_none(), "очередь должна быть пуста");
+    }
+
+    // ── консилиум бесплатных моделей (13 ноя) ──────────────────────────────
+
+    #[test]
+    fn council_shifts_weakly_and_never_closes() {
+        let mut l = Ledger::default();
+        let id = l.add("Держит ли стенд дрейф < 1 px за 72 ч?", None);
+        let c = l
+            .apply(&id, Outcome::CouncilSupport, "probe:dialogue", vec![], "3/3 да", 0)
+            .unwrap();
+        let q = l.get(&id).unwrap();
+        assert!(q.p_true > 0.5, "консилиум должен слабо поднять p: {}", q.p_true);
+        assert!(q.p_true < 0.70, "консилиум не должен быть убедительным: {}", q.p_true);
+        assert_eq!(q.status, QStatus::Open, "консилиум не закрывает вопрос");
+        assert_eq!(c.verifier, VerifyResult::Council);
+        // даже многократно (разные сутки) не пробивает порог закрытия
+        for _ in 0..5 {
+            // имитируем «прошли сутки»: ограничение по 24 ч снимается, потолок остаётся
+            if let Some(q) = l.questions.iter_mut().find(|q| q.id == id) {
+                q.last_council_at = None;
+            }
+            l.apply(&id, Outcome::CouncilSupport, "probe:dialogue", vec![], "", 0);
+        }
+        let q = l.get(&id).unwrap();
+        assert!(q.p_true < P_CLOSE_SUPPORT, "потолок консилиума: p={}", q.p_true);
+        assert!(
+            !matches!(q.status, QStatus::Supported | QStatus::Refuted),
+            "консилиум не имеет права закрыть вопрос: {:?}",
+            q.status
+        );
+    }
+
+    #[test]
+    fn council_cannot_shift_twice_within_a_day() {
+        let mut l = Ledger::default();
+        let id = l.add("Держит ли стенд дрейф < 1 px за 72 ч?", None);
+        l.apply(&id, Outcome::CouncilSupport, "probe:dialogue", vec![], "да", 0);
+        let after_first = l.get(&id).unwrap().p_true;
+        let c = l
+            .apply(&id, Outcome::CouncilSupport, "probe:dialogue", vec![], "да снова", 0)
+            .unwrap();
+        assert_eq!(c.before, c.after, "второй сдвиг за сутки запрещён");
+        assert_eq!(l.get(&id).unwrap().p_true, after_first);
+        assert!(l
+            .get(&id)
+            .unwrap()
+            .gaps
+            .iter()
+            .any(|g| g.contains("за последние 24 ч")));
+    }
+
+    #[test]
+    fn council_is_ignored_for_non_propositions() {
+        let mut l = Ledger::default();
+        let id = l.add("fiducial autofocus drift long-term imaging", None);
+        let c = l
+            .apply(&id, Outcome::CouncilSupport, "probe:dialogue", vec![], "да", 0)
+            .unwrap();
+        assert_eq!(c.before, c.after);
+        assert_eq!(l.get(&id).unwrap().p_true, 0.5);
+    }
+
+    #[test]
+    fn council_cycles_are_counted_separately_in_metrics() {
+        let mut l = Ledger::default();
+        let id = l.add("Держит ли стенд дрейф < 1 px?", None);
+        l.apply(&id, Outcome::CouncilContradict, "probe:dialogue", vec![], "нет", 0);
+        let m = l.metrics();
+        assert_eq!(m.council_cycles, 1);
+        assert_eq!(m.gap_cycles, 0, "консилиум не должен считаться пробелом");
+        assert_eq!(m.id_cycles, 0);
     }
 
     #[test]

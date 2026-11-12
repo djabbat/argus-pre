@@ -4,6 +4,8 @@ use argus_pre::agent::{AgentLoop, LlmConfig, LlmModel, LoopConfig, Mode, StubMod
 use argus_pre::ledger::{self, Ledger, Outcome};
 use argus_pre::memory::{Memory, NoteKind};
 use argus_pre::probe::{self, CorpusSearcher, EpMcSearcher, Searcher};
+use argus_pre::dialogue;
+use argus_pre::lab;
 use argus_pre::stance;
 use argus_pre::verify::{self, Cache, HttpFetcher};
 use std::path::PathBuf;
@@ -44,6 +46,8 @@ fn main() {
         "effects" => cmd_effects(&args, &sdir),
         "think" => cmd_think(&args, &sdir),
         "ledger" => cmd_ledger(&args, &sdir),
+        "lab" => cmd_lab(&args, &sdir),
+        "council" => cmd_council(&args, &sdir),
         "ticket" => cmd_ticket(&args, &sdir),
         "policy" => cmd_policy(&args, &sdir),
         "plan" => println!("План-режим (read-only): запусти run --mode plan."),
@@ -1889,6 +1893,8 @@ struct ThinkCfg {
     channel: String,
     offline: bool,
     judge: Option<String>,
+    /// перед применением лабораторных данных обязательно спросить консилиум
+    require_council: bool,
     corpus: PathBuf,
     qid: Option<String>,
     min_cos: f32,
@@ -1908,6 +1914,7 @@ fn parse_think_cfg(args: &[String], sdir: &PathBuf) -> ThinkCfg {
         channel: arg_str(args, "--probe").unwrap_or_else(|| "none".to_string()),
         offline: args.iter().any(|a| a == "--offline"),
         judge: arg_str(args, "--judge"),
+        require_council: args.iter().any(|a| a == "--require-council"),
         corpus: arg_str(args, "--corpus")
             .map(PathBuf::from)
             .unwrap_or_else(|| sdir.join("corpus")),
@@ -1938,6 +1945,22 @@ fn select_question(cfg: &ThinkCfg, led: &Ledger) -> Result<ledger::Scored, Strin
             staleness_h: 0.0,
             cost: 1.0,
         });
+    }
+    if cfg.channel == "lab" {
+        // лабораторный канал: только `lab`-вопросы, детерминированно по score
+        let now = chrono::Utc::now();
+        let mut best: Option<ledger::Scored> = None;
+        for q in &led.questions {
+            if q.kind != ledger::QKind::Lab {
+                continue;
+            }
+            if let Some(sc) = ledger::score_question_for(q, now, false) {
+                if best.as_ref().map(|b| sc.score > b.score).unwrap_or(true) {
+                    best = Some(sc);
+                }
+            }
+        }
+        return best.ok_or_else(|| "нет открытых лабораторных вопросов".to_string());
     }
     let lit = cfg.channel == "epmc";
     led.select_next_for(cfg.seed, cfg.k, lit)
@@ -2181,7 +2204,9 @@ fn run_cycle(
                                     _ => Outcome::Evidence,
                                 },
                             },
-                            ledger::VerifyResult::Unresolved => Outcome::None,
+                            ledger::VerifyResult::Unresolved | ledger::VerifyResult::Council => {
+                                Outcome::None
+                            }
                         };
                         let ids_out = if verdict == ledger::VerifyResult::Fabricated {
                             bad
@@ -2193,10 +2218,191 @@ fn run_cycle(
                 }
             }
         }
+        // ── лабораторный канал (M4): ответ даёт эксперимент, а не литература ──
+        "lab" => match lab::load(sdir, &pick.id) {
+            None => (
+                Outcome::None,
+                vec![],
+                format!(
+                    "lab: данных нет — нужен эксперимент; положить файл {}",
+                    lab::path_for(sdir, &pick.id).display()
+                ),
+                None,
+            ),
+            Some(ev) => {
+                let now = chrono::Utc::now();
+                match lab::validate(sdir, &ev, now, lab::DEFAULT_MAX_AGE_DAYS, &pick.text) {
+                    Err(why) => (
+                        Outcome::None,
+                        vec![],
+                        format!("lab: {why}"),
+                        None,
+                    ),
+                    Ok(()) => {
+                        let stance_wanted = match ev.verdict {
+                            lab::LabVerdict::Support => stance::Stance::Support,
+                            lab::LabVerdict::Contradict => stance::Stance::Contradict,
+                            lab::LabVerdict::Inconclusive => stance::Stance::Neutral,
+                        };
+                        // решение Джабы 13.11: до применения лабораторных данных — консилиум
+                        let mut council_note = String::new();
+                        let mut blocked = None;
+                        if cfg.require_council && dialogue::CouncilConfig::enabled() {
+                            let cc = dialogue::CouncilConfig::from_env();
+                            let problem = led
+                                .get(&pick.id)
+                                .and_then(|q| q.expected.clone())
+                                .unwrap_or_default();
+                            let ctx = format!(
+                                "лабораторные данные: вердикт {}, значение «{}», источник {}, примечание «{}»",
+                                ev.verdict.as_str(),
+                                ev.value,
+                                ev.source,
+                                ev.note
+                            );
+                            let cons = dialogue::consult(&cc, &pick.text, &problem, &ctx);
+                            if !cfg.quiet {
+                                println!("    {}", cons.reason);
+                                for o in &cons.opinions {
+                                    println!(
+                                        "    council {} {} ({:.2}) — {}",
+                                        o.model,
+                                        o.stance_str(),
+                                        o.confidence,
+                                        o.key_point
+                                    );
+                                }
+                            }
+                            if cons.acts() && cons.stance != stance_wanted {
+                                blocked = Some(format!(
+                                    "консилиум против данных: {} — нужен ручной разбор",
+                                    cons.reason
+                                ));
+                            }
+                            council_note = format!(" · {}", cons.reason);
+                        }
+                        match blocked {
+                            Some(why) => (
+                                Outcome::None,
+                                vec![],
+                                format!("lab: {why}{council_note}"),
+                                None,
+                            ),
+                            None => {
+                                let d = stance::Decision {
+                                    stance: stance_wanted,
+                                    confidence: 0.95,
+                                    source: "lab:file",
+                                    reason: format!(
+                                        "эксперимент: {} — «{}» ({}){}",
+                                        ev.verdict.as_str(),
+                                        ev.value,
+                                        ev.source,
+                                        council_note
+                                    ),
+                                };
+                                let outcome = match ev.verdict {
+                                    lab::LabVerdict::Support => Outcome::Support,
+                                    lab::LabVerdict::Contradict => Outcome::Contradict,
+                                    lab::LabVerdict::Inconclusive => Outcome::None,
+                                };
+                                (
+                                    outcome,
+                                    vec![format!("lab:{}", ev.source)],
+                                    format!(
+                                        "lab: {} ({}), источник {}{council_note}",
+                                        ev.verdict.as_str(),
+                                        ev.value,
+                                        ev.source
+                                    ),
+                                    Some(d),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        // ── канал диалога: консилиум бесплатных моделей ──
+        "dialogue" => {
+            let cc = dialogue::CouncilConfig::from_env();
+            if !dialogue::CouncilConfig::enabled() || cc.members.is_empty() {
+                (
+                    Outcome::None,
+                    vec![],
+                    "сouncil: канал выключен (ARGUS_COUNCIL=0) или пустой состав".to_string(),
+                    None,
+                )
+            } else {
+                let q = led.get(&pick.id).cloned();
+                let problem = q
+                    .as_ref()
+                    .and_then(|q| q.expected.clone())
+                    .unwrap_or_default();
+                let ctx = format!(
+                    "форма вопроса: {}; проб сделано: {}; найдено идентификаторов: {}; известные данные: {}",
+                    q.as_ref().map(|q| q.form().as_str()).unwrap_or("?"),
+                    q.as_ref().map(|q| q.probes).unwrap_or(0),
+                    q.as_ref().map(|q| q.identifiers.len()).unwrap_or(0),
+                    q.as_ref()
+                        .map(|q| q.identifiers.join(", "))
+                        .unwrap_or_default()
+                );
+                let cons = dialogue::consult(&cc, &pick.text, &problem, &ctx);
+                if !cfg.quiet {
+                    println!("    {}", cons.reason);
+                    for o in &cons.opinions {
+                        println!(
+                            "    council {} {} ({:.2}) — {} {}",
+                            o.model,
+                            o.stance_str(),
+                            o.confidence,
+                            o.key_point,
+                            if o.missing.is_empty() {
+                                String::new()
+                            } else {
+                                format!("| не хватает: {}", o.missing)
+                            }
+                        );
+                    }
+                }
+                let outcome = if cons.acts() {
+                    match cons.stance {
+                        stance::Stance::Support => Outcome::CouncilSupport,
+                        stance::Stance::Contradict => Outcome::CouncilContradict,
+                        stance::Stance::Neutral => Outcome::None,
+                    }
+                } else {
+                    Outcome::None
+                };
+                let d = stance::Decision {
+                    stance: cons.stance,
+                    confidence: cons.confidence,
+                    source: "council",
+                    reason: format!("{} [{}]", cons.reason, cons.label()),
+                };
+                (
+                    outcome,
+                    vec![],
+                    format!(
+                        "консилиум {}: {}{}",
+                        cons.label(),
+                        cons.reason,
+                        cons.opinions
+                            .iter()
+                            .filter(|o| !o.key_point.is_empty())
+                            .map(|o| format!("
+    • {}: {}", o.model, o.key_point))
+                            .collect::<String>()
+                    ),
+                    Some(d),
+                )
+            }
+        }
         _ => (
             Outcome::None,
             vec![],
-            "канал пробы не выбран (--probe epmc|corpus)".to_string(),
+            "канал пробы не выбран (--probe epmc|corpus|lab|dialogue)".to_string(),
             None,
         ),
     };
@@ -2585,6 +2791,148 @@ fn stance_stats(cycles: &[ledger::Cycle]) -> (usize, usize) {
         .filter(|c| (c.after - c.before).abs() > f64::EPSILON)
         .count();
     (judged, acted)
+}
+
+/// `lab` — лабораторные данные (ответ на lab-вопросы даёт эксперимент).
+fn cmd_lab(args: &[String], sdir: &PathBuf) {
+    let sub = args.get(2).map(String::as_str).unwrap_or("list");
+    match sub {
+        "list" => {
+            let led = Ledger::load(sdir);
+            let now = chrono::Utc::now();
+            let labs: Vec<_> = led
+                .questions
+                .iter()
+                .filter(|q| q.kind == ledger::QKind::Lab)
+                .collect();
+            if labs.is_empty() {
+                println!("лабораторных вопросов нет: ledger add \"...\" --kind lab");
+                return;
+            }
+            println!("{:<12} {:<9} {:<8} {}", "id", "status", "данные", "вопрос");
+            for q in labs {
+                match lab::load(sdir, &q.id) {
+                    None => println!(
+                        "{:<12} {:<9} {:<8} {}",
+                        q.id,
+                        q.status_str(),
+                        "нет",
+                        q.text
+                    ),
+                    Some(ev) => {
+                        let ok = lab::validate(sdir, &ev, now, lab::DEFAULT_MAX_AGE_DAYS, &q.text);
+                        let mark = if ok.is_ok() { "готово" } else { "непригодно" };
+                        println!(
+                            "{:<12} {:<9} {:<8} {} → {} ({})",
+                            q.id,
+                            q.status_str(),
+                            mark,
+                            q.text,
+                            ev.verdict.as_str(),
+                            ev.source
+                        );
+                        if let Err(why) = ok {
+                            println!("{:>31}⚠️ {why}", "");
+                        }
+                    }
+                }
+            }
+        }
+        "record" => {
+            let qid = args.get(3).cloned().unwrap_or_default();
+            let verdict_raw = args.get(4).cloned().unwrap_or_default();
+            let Some(verdict) = lab::LabVerdict::parse(&verdict_raw) else {
+                println!("использование: lab record <qid> support|contradict|inconclusive --source ПУТЬ [--value \"...\"] [--note \"...\"] [--at YYYY-MM-DD]");
+                return;
+            };
+            let Some(source) = arg_str(args, "--source") else {
+                println!("⚠️ обязателен --source: цифра без артефакта не принимается");
+                return;
+            };
+            let ev = lab::LabEvidence {
+                qid: qid.clone(),
+                verdict,
+                value: arg_str(args, "--value").unwrap_or_default(),
+                source,
+                note: arg_str(args, "--note").unwrap_or_default(),
+                at: arg_str(args, "--at").or_else(|| Some(chrono::Local::now().format("%Y-%m-%d").to_string())),
+            };
+            match lab::record(sdir, &ev) {
+                Ok(p) => {
+                    println!("✅ записано: {}", p.display());
+                    match lab::validate(sdir, &ev, chrono::Utc::now(), lab::DEFAULT_MAX_AGE_DAYS, "") {
+                        Ok(()) => println!("   проверка пройдена: данные применимы в канале `lab`"),
+                        Err(why) => println!("   ⚠️ проверка не пройдена: {why}"),
+                    }
+                }
+                Err(e) => println!("⚠️ не записано: {e}"),
+            }
+        }
+        _ => println!("lab list | lab record <qid> support|contradict|inconclusive --source ПУТЬ [--value ...] [--note ...] [--at ДАТА]"),
+    }
+}
+
+/// `council` — консилиум бесплатных моделей (мнение, не доказательство).
+fn cmd_council(args: &[String], sdir: &PathBuf) {
+    let sub = args.get(2).map(String::as_str).unwrap_or("models");
+    let cc = dialogue::CouncilConfig::from_env();
+    match sub {
+        "models" => {
+            println!("состав ({}):", cc.members.len());
+            for m in &cc.members {
+                println!("  {} → {} [{:?}]", m.model, m.url, m.api);
+            }
+            println!("порог согласия: {} моделей, уверенность ≥ {:.2}", cc.min_agree, dialogue::ACT_CONF);
+            println!("выключить: ARGUS_COUNCIL=0; сменить состав: ARGUS_COUNCIL_MODELS=\"m1,m2\"");
+        }
+        "ask" => {
+            let qid = args.get(3).cloned().unwrap_or_default();
+            let led = Ledger::load(sdir);
+            let Some(q) = led.get(&qid) else {
+                println!("нет такого вопроса: {qid}");
+                return;
+            };
+            let problem = arg_str(args, "--problem")
+                .or_else(|| q.expected.clone())
+                .unwrap_or_default();
+            let ctx = format!(
+                "форма: {}; проб: {}; идентификаторов: {}",
+                q.form().as_str(),
+                q.probes,
+                q.identifiers.len()
+            );
+            println!("вопрос: {}", q.text);
+            if !problem.trim().is_empty() {
+                println!("проблема: {problem}");
+            }
+            let cons = dialogue::consult(&cc, &q.text, &problem, &ctx);
+            for o in &cons.opinions {
+                println!(
+                    "  {} {} ({:.2}) — {} {}",
+                    o.model,
+                    o.stance_str(),
+                    o.confidence,
+                    o.key_point,
+                    if o.missing.is_empty() {
+                        String::new()
+                    } else {
+                        format!("| не хватает: {}", o.missing)
+                    }
+                );
+            }
+            println!(
+                "итог: {} · {} · {}",
+                cons.label(),
+                cons.reason,
+                if cons.acts() {
+                    "можно применить (слабый сдвиг приора)"
+                } else {
+                    "применять нельзя"
+                }
+            );
+        }
+        _ => println!("council models | council ask <qid> [--problem \"...\"]"),
+    }
 }
 
 fn cmd_ledger(args: &[String], sdir: &PathBuf) {

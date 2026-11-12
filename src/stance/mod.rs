@@ -97,7 +97,8 @@ pub fn detect_form(text: &str) -> QForm {
 }
 
 /// Позиция свидетельства относительно претензии.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum Stance {
     Support,
     Contradict,
