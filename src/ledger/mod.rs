@@ -31,6 +31,8 @@ pub const P_CLOSE_REFUTE: f64 = 0.10;
 pub const MAX_CYCLES_PER_HOUR: u32 = 20;
 pub const MAX_TOKENS_PER_DAY: u64 = 200_000;
 pub const MAX_PROBES_PER_QUESTION: u32 = 12;
+/// После стольких проб подряд без идентификаторов вопрос уходит в `Gap` и освобождает очередь.
+pub const MAX_CONSECUTIVE_GAPS: u32 = 3;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -67,6 +69,15 @@ pub enum Outcome {
     Evidence,
 }
 
+/// M4-фикс: лабораторный вопрос («держит ли фокус дрейф <1 px за 72 ч») литературой не отвечается.
+/// Проба по Europe PMC имеет смысл только для `Lit`; `Lab` отвечается экспериментом и файлами.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum QKind {
+    Lit,
+    Lab,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Question {
     pub id: String,
@@ -89,6 +100,16 @@ pub struct Question {
     #[serde(default)]
     pub gaps: Vec<String>,
     pub status: QStatus,
+    /// литературный вопрос или лабораторный (влияет на выбор канала пробы)
+    #[serde(default = "default_kind")]
+    pub kind: QKind,
+    /// сколько проб подряд не дали ни одного идентификатора (защита от «залипания»)
+    #[serde(default)]
+    pub consecutive_gaps: u32,
+}
+
+fn default_kind() -> QKind {
+    QKind::Lit
 }
 
 fn half() -> f64 {
@@ -109,6 +130,15 @@ impl Question {
             refutations: Vec::new(),
             gaps: Vec::new(),
             status: QStatus::Open,
+            kind: QKind::Lit,
+            consecutive_gaps: 0,
+        }
+    }
+
+    pub fn kind_str(&self) -> &'static str {
+        match self.kind {
+            QKind::Lit => "lit",
+            QKind::Lab => "lab",
         }
     }
 }
@@ -331,11 +361,25 @@ pub fn extract_identifiers(text: &str) -> Vec<String> {
 
 /// Свежесть + удивление + стоимость (спека §3.1).
 pub fn score_question(q: &Question, now: DateTime<Utc>) -> Option<Scored> {
+    score_question_for(q, now, true)
+}
+
+/// То же, но с учётом канала: литературная проба (`epmc`) не имеет права брать `Lab`-вопросы.
+pub fn score_question_for(q: &Question, now: DateTime<Utc>, lit_channel: bool) -> Option<Scored> {
     if q.status != QStatus::Open || q.probes >= MAX_PROBES_PER_QUESTION {
         return None;
     }
+    if lit_channel && q.kind == QKind::Lab {
+        return None;
+    }
+    // бонус за пробел ограничен: иначе «чем хуже ищется, тем чаще выбирается» —
+    // положительная обратная связь, которая морит остальные вопросы голодом (найдено 12 ноя)
     let surprise = (logit(q.p_true) - logit(q.p_prev)).abs()
-        + if q.gaps.is_empty() { 0.0 } else { 0.5 };
+        + if q.consecutive_gaps == 0 || q.consecutive_gaps >= MAX_CONSECUTIVE_GAPS {
+            0.0
+        } else {
+            0.5 / q.consecutive_gaps as f64
+        };
     let ref_ts = parse_ts(q.last_probed.as_deref().unwrap_or(&q.created))?;
     let staleness_h = ((now - ref_ts).num_seconds().max(0) as f64) / 3600.0;
     let cost = 1.0 + 0.25 * q.probes as f64;
@@ -398,7 +442,12 @@ impl Ledger {
 
     /// Добавляет вопрос (или «переоткрывает» закрытый) и возвращает его id.
     pub fn add(&mut self, text: &str, p: Option<f64>) -> String {
+        self.add_kind(text, p, QKind::Lit)
+    }
+
+    pub fn add_kind(&mut self, text: &str, p: Option<f64>, kind: QKind) -> String {
         let mut q = Question::new(text);
+        q.kind = kind;
         if let Some(p) = p {
             q.p_true = p.clamp(P_MIN, P_MAX);
             q.p_prev = q.p_true;
@@ -421,10 +470,15 @@ impl Ledger {
 
     /// Топ-K кандидатов по score (детерминированно).
     pub fn ranked(&self, now: DateTime<Utc>) -> Vec<Scored> {
+        self.ranked_for(now, false)
+    }
+
+    /// `lit_channel = true` — литературная проба: `Lab`-вопросы исключены.
+    pub fn ranked_for(&self, now: DateTime<Utc>, lit_channel: bool) -> Vec<Scored> {
         let mut v: Vec<Scored> = self
             .questions
             .iter()
-            .filter_map(|q| score_question(q, now))
+            .filter_map(|q| score_question_for(q, now, lit_channel))
             .collect();
         v.sort_by(|a, b| {
             b.score
@@ -437,7 +491,11 @@ impl Ledger {
 
     /// Выбор вопроса: взвешенная рулетка по score среди топ-K, seeded (воспроизводимо).
     pub fn select_next(&self, seed: u64, k: usize) -> Option<Scored> {
-        let ranked = self.ranked(Utc::now());
+        self.select_next_for(seed, k, false)
+    }
+
+    pub fn select_next_for(&self, seed: u64, k: usize, lit_channel: bool) -> Option<Scored> {
+        let ranked = self.ranked_for(Utc::now(), lit_channel);
         if ranked.is_empty() {
             return None;
         }
@@ -477,16 +535,23 @@ impl Ledger {
             // выдуманный идентификатор: hard fail, вероятность НЕ двигается
             Outcome::Fabricated => {
                 q.status = QStatus::Blocked;
+                q.consecutive_gaps = 0;
                 (VerifyResult::Fabricated, before)
             }
             Outcome::None => {
                 q.gaps.push(note.to_string());
+                q.consecutive_gaps += 1;
+                if q.consecutive_gaps >= MAX_CONSECUTIVE_GAPS {
+                    q.status = QStatus::Gap;
+                }
                 (VerifyResult::Unresolved, before)
             }
             Outcome::Evidence => {
                 if identifiers.is_empty() {
+                    q.consecutive_gaps += 1;
                     (VerifyResult::Unresolved, before)
                 } else {
+                    q.consecutive_gaps = 0;
                     for i in &identifiers {
                         if !q.identifiers.contains(i) {
                             q.identifiers.push(i.clone());
@@ -623,13 +688,16 @@ pub fn gate_failed(m: &Metrics) -> bool {
 }
 
 /// Реальные открытые вопросы ARGUS-OS1 для засева (не выдуманные: из STATE/TODO/TRD).
-pub fn argus_default_questions() -> Vec<&'static str> {
+pub fn argus_default_questions() -> Vec<(&'static str, QKind)> {
     vec![
-        "Держит ли fiducial-autofocus дрейф < 1 px за 72 ч на OpenFlexure (P0, дедлайн 15 янв 2027)?",
-        "Падает ли recall ниже 0.5 при 250 нм/px на фантоме readout (бенчмарк, DOI 10.5281/zenodo.24148459)?",
-        "Нужен ли Amendment 3 к протоколу v0.3 при переходе на выборку ≤100 нм/px без бининга >2×2?",
-        "Сходится ли Centrin1-GFP и SAS-4::mCherry на одном центриоле (пилот P4, кросс-валидация маркеров)?",
-        "Достаточно ли 3 ч imaging без фототоксического потолка для SAS-4::GFP (пилот P2/P3)?",
+        // литературные: на них может ответить Europe PMC
+        ("Какая точность fiducial-based autofocus достигнута в опубликованных открытых микроскопах?", QKind::Lit),
+        ("Сходится ли Centrin1-GFP и SAS-4::mCherry на одном центриоле (пилот P4, кросс-валидация маркеров)?", QKind::Lit),
+        ("Достаточно ли 3 ч imaging без фототоксического потолка для SAS-4::GFP (пилот P2/P3)?", QKind::Lit),
+        // лабораторные: литературой не отвечаются, нужен эксперимент/файлы
+        ("Держит ли fiducial-autofocus дрейф < 1 px за 72 ч на OpenFlexure (P0, дедлайн 15 янв 2027)?", QKind::Lab),
+        ("Падает ли recall ниже 0.5 при 250 нм/px на фантоме readout (бенчмарк, DOI 10.5281/zenodo.24148459)?", QKind::Lab),
+        ("Нужен ли Amendment 3 к протоколу v0.3 при переходе на выборку ≤100 нм/px без бининга >2×2?", QKind::Lab),
     ]
 }
 
@@ -782,8 +850,42 @@ mod tests {
     #[test]
     fn default_questions_are_real_and_unique() {
         let qs = argus_default_questions();
-        assert_eq!(qs.len(), 5);
-        let ids: std::collections::HashSet<String> = qs.iter().map(|t| qid(t)).collect();
-        assert_eq!(ids.len(), 5);
+        assert_eq!(qs.len(), 6);
+        let ids: std::collections::HashSet<String> = qs.iter().map(|(t, _)| qid(t)).collect();
+        assert_eq!(ids.len(), 6);
+        assert_eq!(
+            qs.iter().filter(|(_, k)| *k == QKind::Lit).count(),
+            3,
+            "должно быть 3 литературных вопроса"
+        );
+    }
+
+    #[test]
+    fn failing_question_goes_to_gap_and_frees_queue() {
+        let mut l = Ledger::default();
+        let bad = l.add("плохо ищущийся вопрос", None);
+        let good = l.add("нормальный вопрос", None);
+        for _ in 0..MAX_CONSECUTIVE_GAPS {
+            l.apply(&bad, Outcome::None, "probe:epmc", vec![], "0 попаданий", 0);
+        }
+        assert_eq!(l.get(&bad).unwrap().status, QStatus::Gap);
+        // очередь обязана переключиться на другой вопрос
+        for seed in 0..10 {
+            assert_eq!(l.select_next(seed, 3).unwrap().id, good, "seed={seed}");
+        }
+    }
+
+    #[test]
+    fn literature_channel_skips_lab_questions() {
+        let mut l = Ledger::default();
+        let lit = l.add_kind("литературный вопрос", None, QKind::Lit);
+        l.add_kind("лабораторный вопрос", None, QKind::Lab);
+        for seed in 0..5 {
+            assert_eq!(l.select_next_for(seed, 3, true).unwrap().id, lit, "seed={seed}");
+        }
+        // без ограничения канала доступны оба
+        let ids: std::collections::HashSet<String> =
+            (0..20).map(|s| l.select_next_for(s, 3, false).unwrap().id).collect();
+        assert_eq!(ids.len(), 2);
     }
 }

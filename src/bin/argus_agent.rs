@@ -1823,6 +1823,40 @@ fn arg_str(args: &[String], key: &str) -> Option<String> {
         .cloned()
 }
 
+
+// ── M4-фикс: защита от двух одновременных циклов (последняя запись затирала состояние) ──
+struct LoopLock {
+    path: PathBuf,
+}
+
+impl LoopLock {
+    fn acquire(sdir: &PathBuf) -> Result<LoopLock, String> {
+        let path = sdir.join("ledger").join("think.lock");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(prev) = std::fs::read_to_string(&path) {
+            let pid: u32 = prev.trim().parse().unwrap_or(0);
+            let alive = pid > 0 && std::path::Path::new(&format!("/proc/{pid}")).exists();
+            if alive && pid != std::process::id() {
+                return Err(format!(
+                    "уже запущен другой idle-цикл (pid {pid}); файл {} — остановите его или удалите lock",
+                    path.display()
+                ));
+            }
+        }
+        std::fs::write(&path, std::process::id().to_string())
+            .map_err(|e| format!("lock не создан: {e}"))?;
+        Ok(LoopLock { path })
+    }
+}
+
+impl Drop for LoopLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 struct ThinkCfg {
     dry: bool,
     seed: u64,
@@ -1877,8 +1911,9 @@ fn select_question(cfg: &ThinkCfg, led: &Ledger) -> Result<ledger::Scored, Strin
             cost: 1.0,
         });
     }
-    led.select_next(cfg.seed, cfg.k)
-        .ok_or_else(|| "нет открытых вопросов (все закрыты/заблокированы)".to_string())
+    let lit = cfg.channel == "epmc";
+    led.select_next_for(cfg.seed, cfg.k, lit)
+        .ok_or_else(|| "нет открытых вопросов, подходящих под канал пробы".to_string())
 }
 
 /// Один цикл: выбор вопроса → проба → резолв → запись. Возвращает (qid, note, tokens).
@@ -2045,7 +2080,7 @@ fn cmd_think(args: &[String], sdir: &PathBuf) {
 
     // план: пул + выбранный вопрос, без записи
     if cfg.dry {
-        let ranked = led.ranked(chrono::Utc::now());
+        let ranked = led.ranked_for(chrono::Utc::now(), cfg.channel == "epmc");
         println!("пул (seed={}, k={}):", cfg.seed, cfg.k);
         for (i, s) in ranked.iter().take(cfg.k).enumerate() {
             println!(
@@ -2089,6 +2124,13 @@ fn cmd_think(args: &[String], sdir: &PathBuf) {
     }
 
     // ── M3: непрерывный цикл с бюджетом ─────────────────────────────────────
+    let _lock = match LoopLock::acquire(sdir) {
+        Ok(l) => l,
+        Err(e) => {
+            println!("⛔ {e}");
+            return;
+        }
+    };
     let max_cycles = arg_num(args, "--max-cycles");
     let interval = std::time::Duration::from_secs(cfg.interval_secs.max(10));
     println!(
@@ -2249,16 +2291,17 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
                 println!("леджер пуст: ledger seed | ledger add \"вопрос\"");
                 return;
             }
-            println!("{:<12} {:>6} {:>3}  {:<10} {}", "id", "p", "n", "status", "вопрос");
+            println!("{:<12} {:>6} {:>3}  {:<9} {:<3} {}", "id", "p", "n", "status", "вид", "вопрос");
             let mut qs = led.questions.clone();
             qs.sort_by(|a, b| a.status_key().cmp(&b.status_key()).then(a.id.cmp(&b.id)));
             for q in qs {
                 println!(
-                    "{:<12} {:>6.2} {:>3}  {:<10} {}",
+                    "{:<12} {:>6.2} {:>3}  {:<9} {:<3} {}",
                     q.id,
                     q.p_true,
                     q.probes,
                     q.status_str(),
+                    q.kind_str(),
                     q.text
                 );
             }
@@ -2280,11 +2323,11 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
         }
         "seed" => {
             let mut n = 0;
-            for t in ledger::argus_default_questions() {
+            for (t, kind) in ledger::argus_default_questions() {
                 if led.get(&ledger::qid(t)).is_some() {
                     continue;
                 }
-                led.add(t, None);
+                led.add_kind(t, None, kind);
                 n += 1;
             }
             let _ = led.save(sdir);
@@ -2340,8 +2383,28 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
                 None => println!("нет такого вопроса: {id}"),
             }
         }
+        "set-kind" => {
+            let id = args.get(3).cloned().unwrap_or_default();
+            let kind = match args.get(4).map(String::as_str) {
+                Some("lab") => ledger::QKind::Lab,
+                Some("lit") => ledger::QKind::Lit,
+                _ => {
+                    println!("использование: ledger set-kind <id> lit|lab");
+                    return;
+                }
+            };
+            match led.questions.iter_mut().find(|q| q.id == id) {
+                Some(q) => {
+                    q.kind = kind;
+                    let k = q.kind_str();
+                    let _ = led.save(sdir);
+                    println!("✅ {id} → {k}");
+                }
+                None => println!("нет такого вопроса: {id}"),
+            }
+        }
         "report" => print_idle_report(sdir),
-        _ => println!("ledger list | add \"...\" [--p 0.5] | show <id> | seed | close <id> gap|refuted|supported | report"),
+        _ => println!("ledger list | add \"...\" [--p 0.5] [--kind lit|lab] | show <id> | seed | set-kind <id> lit|lab | close <id> gap|refuted|supported | report"),
     }
 }
 
