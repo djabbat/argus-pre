@@ -134,7 +134,10 @@ mod tests {
         assert!(b.gate(now).is_ok());
         b.record(now, 10);
         b.record(now, 10);
-        assert!(b.gate(now).is_err(), "третий цикл в час должен быть заблокирован");
+        assert!(
+            b.gate(now).is_err(),
+            "третий цикл в час должен быть заблокирован"
+        );
         assert_eq!(b.hour_remaining(now), 0);
     }
 
@@ -155,7 +158,11 @@ mod tests {
         b.recent.push((now - Duration::minutes(90)).to_rfc3339());
         b.recent.push((now - Duration::minutes(30)).to_rfc3339());
         b.roll_over(now);
-        assert_eq!(b.recent.len(), 1, "старая метка должна выпасть из окна часа");
+        assert_eq!(
+            b.recent.len(),
+            1,
+            "старая метка должна выпасть из окна часа"
+        );
     }
 
     #[test]

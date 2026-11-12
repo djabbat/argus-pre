@@ -284,12 +284,7 @@ impl EffectsQueue {
     }
 
     // ---- Enqueue (P8d: тот же waiting key → replace payload, due немедленно) ----
-    pub fn enqueue(
-        &mut self,
-        kind: EffectKind,
-        key: &str,
-        payload: serde_json::Value,
-    ) -> u64 {
+    pub fn enqueue(&mut self, kind: EffectKind, key: &str, payload: serde_json::Value) -> u64 {
         self.enqueue_with_attention(kind, key, payload, Attention::Action)
     }
 
@@ -401,7 +396,8 @@ impl EffectsQueue {
                 if now - eff.next_run_at > RUNNING_TIMEOUT_MS {
                     eff.status = EffectStatus::Pending;
                     eff.next_run_at = now_ms();
-                    eff.last_error = Some("watchdog: истёк RUNNING_TIMEOUT, эффект возвращён в очередь".into());
+                    eff.last_error =
+                        Some("watchdog: истёк RUNNING_TIMEOUT, эффект возвращён в очередь".into());
                     eff.updated_at = now_rfc3339();
                     revived += 1;
                 }
@@ -452,7 +448,10 @@ impl EffectsQueue {
             let handler = self.handlers.get(&eff_clone.kind);
             let result = match handler {
                 Some(h) => h(&eff_clone, state_dir),
-                None => Err(format!("нет обработчика для вида '{}'", eff_clone.kind.name())),
+                None => Err(format!(
+                    "нет обработчика для вида '{}'",
+                    eff_clone.kind.name()
+                )),
             };
             // обновляем состояние после обработчика
             let now2 = now_ms();
@@ -504,7 +503,8 @@ impl EffectsQueue {
     /// Отменить (только pending): cancelled → удалить.
     pub fn cancel(&mut self, id: u64) -> Result<(), String> {
         let before = self.effects.len();
-        self.effects.retain(|e| !(e.id == id && e.status == EffectStatus::Pending));
+        self.effects
+            .retain(|e| !(e.id == id && e.status == EffectStatus::Pending));
         if self.effects.len() == before {
             Err("эффект не найден или уже выполняется".into())
         } else {
@@ -587,7 +587,11 @@ pub fn http_post_handler(eff: &Effect, _state: &Path) -> Result<(), String> {
         .get("url")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "payload.url отсутствует".to_string())?;
-    let body = eff.payload.get("body").cloned().unwrap_or(serde_json::json!({}));
+    let body = eff
+        .payload
+        .get("body")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
     let timeout_ms = eff
         .payload
         .get("timeout_ms")
@@ -626,7 +630,11 @@ pub fn command_handler(eff: &Effect, _state: &Path) -> Result<(), String> {
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        Err(format!("exit {}: {}", out.status, stderr.trim().chars().take(200).collect::<String>()))
+        Err(format!(
+            "exit {}: {}",
+            out.status,
+            stderr.trim().chars().take(200).collect::<String>()
+        ))
     }
 }
 
@@ -642,8 +650,11 @@ pub fn report_handler(eff: &Effect, state: &Path) -> Result<(), String> {
         "payload": eff.payload,
         "done_at": now_rfc3339(),
     });
-    fs::write(&path, serde_json::to_string_pretty(&doc).unwrap_or_default())
-        .map_err(|e| format!("write: {e}"))
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&doc).unwrap_or_default(),
+    )
+    .map_err(|e| format!("write: {e}"))
 }
 
 /// Обработчик Notify: выводит уведомление в stderr (заглушка; реальный канал — gabro-notify).
@@ -696,8 +707,16 @@ mod tests {
     #[test]
     fn enqueue_dedup_same_key_replaces_payload() {
         let (mut q, _) = q("dedup");
-        let a = q.enqueue(EffectKind::Notify, "k1", serde_json::json!({"message": "первое"}));
-        let b = q.enqueue(EffectKind::Notify, "k1", serde_json::json!({"message": "второе"}));
+        let a = q.enqueue(
+            EffectKind::Notify,
+            "k1",
+            serde_json::json!({"message": "первое"}),
+        );
+        let b = q.enqueue(
+            EffectKind::Notify,
+            "k1",
+            serde_json::json!({"message": "второе"}),
+        );
         assert_eq!(a, b, "тот же key → тот же id");
         assert_eq!(q.effects.len(), 1);
         assert_eq!(
@@ -778,7 +797,11 @@ mod tests {
         q.register_handler(EffectKind::Internal, ok_handler());
         q.concurrency = 1;
         for i in 0..3 {
-            q.enqueue(EffectKind::Internal, &format!("c{i}"), serde_json::json!({}));
+            q.enqueue(
+                EffectKind::Internal,
+                &format!("c{i}"),
+                serde_json::json!({}),
+            );
         }
         let (_d, _e) = q.process_due(&d);
         // с concurrency=1 и мгновенными обработчиками всё успеет за один проход
@@ -806,7 +829,11 @@ mod tests {
         let (mut q, d) = q("health");
         q.register_handler(EffectKind::External, fail_handler());
         for i in 0..3 {
-            q.enqueue(EffectKind::External, &format!("h{i}"), serde_json::json!({}));
+            q.enqueue(
+                EffectKind::External,
+                &format!("h{i}"),
+                serde_json::json!({}),
+            );
         }
         // прогоняем до исчерпания max_attempts; между проходами сбрасываем backoff
         for _ in 0..5 {
@@ -827,7 +854,11 @@ mod tests {
     fn persists_across_load() {
         let (mut q, d) = q("persist");
         q.register_handler(EffectKind::Report, ok_handler());
-        q.enqueue(EffectKind::Report, "p", serde_json::json!({"text": "сохрани меня"}));
+        q.enqueue(
+            EffectKind::Report,
+            "p",
+            serde_json::json!({"text": "сохрани меня"}),
+        );
         q.save(&d);
         let q2 = EffectsQueue::load(&d);
         assert_eq!(q2.effects.len(), 1);
@@ -841,10 +872,18 @@ mod tests {
     #[test]
     fn no_handler_reports_error_and_backs_off() {
         let (mut q, d) = q("nohandler");
-        q.enqueue(EffectKind::Command, "c", serde_json::json!({"command": "true"}));
+        q.enqueue(
+            EffectKind::Command,
+            "c",
+            serde_json::json!({"command": "true"}),
+        );
         let (_d, errors) = q.process_due(&d);
         assert_eq!(errors, 1);
-        assert!(q.effects[0].last_error.as_deref().unwrap().contains("нет обработчика"));
+        assert!(q.effects[0]
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("нет обработчика"));
     }
 
     // ---- P8g: философия внимания ----

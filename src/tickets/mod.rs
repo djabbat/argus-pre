@@ -281,8 +281,7 @@ impl TicketStore {
     pub fn load(state_dir: &Path) -> Self {
         let tdir = state_dir.join("tickets");
         fs::create_dir_all(&tdir).ok();
-        let tickets: Vec<Ticket> =
-            read_json(&tdir.join("tickets.json")).unwrap_or_default();
+        let tickets: Vec<Ticket> = read_json(&tdir.join("tickets.json")).unwrap_or_default();
         let next_id = tickets.iter().map(|t| t.id).max().unwrap_or(0) + 1;
         TicketStore { tickets, next_id }
     }
@@ -459,7 +458,10 @@ mod tests {
         });
         p.recompute_version();
         assert_ne!(v1, p.version);
-        assert!(!t.mandate.revalidates(&p), "мандат аннулируется при смене Policy");
+        assert!(
+            !t.mandate.revalidates(&p),
+            "мандат аннулируется при смене Policy"
+        );
     }
 
     #[test]
@@ -512,7 +514,10 @@ mod p8c_tests {
         let a = gate(&p, "Jaba", "работа1");
         let mut store = TicketStore::load(&d);
         let t1 = store.open_ticket(&p, "Jaba", "работа1", &a).unwrap();
-        assert!(store.open_stale_mandates(&p).is_empty(), "до смены — всё валидно");
+        assert!(
+            store.open_stale_mandates(&p).is_empty(),
+            "до смены — всё валидно"
+        );
 
         // меняем Policy (добавляем правило) → версия изменится → мандат t1 устарел
         p.rules.push(AllowRule {

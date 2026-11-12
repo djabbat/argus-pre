@@ -26,6 +26,8 @@
 //! её вероятность не определена; количественный вопрос («насколько дрейфует фокус»)
 //! требует оценки, а не подтверждения. Обе формы помечаются и к сдвигу p не допускаются.
 
+pub mod llm;
+
 /// Форма вопроса: к чему вообще применима байесовская бухгалтерия.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -202,9 +204,36 @@ const SUPPORT_CUES: [&str; 24] = [
 
 fn stems(text: &str) -> Vec<String> {
     const STOP: [&str; 30] = [
-        "the", "and", "for", "with", "from", "this", "that", "are", "was", "has", "its", "not",
-        "can", "than", "ли", "или", "при", "для", "что", "как", "чем", "есть", "было", "были",
-        "будет", "держит", "падает", "нужен", "нужна", "достаточно",
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "this",
+        "that",
+        "are",
+        "was",
+        "has",
+        "its",
+        "not",
+        "can",
+        "than",
+        "ли",
+        "или",
+        "при",
+        "для",
+        "что",
+        "как",
+        "чем",
+        "есть",
+        "было",
+        "были",
+        "будет",
+        "держит",
+        "падает",
+        "нужен",
+        "нужна",
+        "достаточно",
     ];
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -276,7 +305,10 @@ pub fn classify(question: &str, title: &str, abstract_text: &str) -> Decision {
     if hits < MIN_ANCHORS || ratio < MIN_ANCHOR_RATIO {
         return Decision::neutral(
             source,
-            format!("тема не подтверждена лексически (якорей {hits}/{}, {ratio:.2})", q_stems.len()),
+            format!(
+                "тема не подтверждена лексически (якорей {hits}/{}, {ratio:.2})",
+                q_stems.len()
+            ),
         );
     }
 
@@ -361,7 +393,10 @@ pub fn aggregate(decisions: &[Decision]) -> Decision {
     if acts.is_empty() {
         return Decision::neutral(
             "lexical:aggregate",
-            format!("нет уверенных позиций среди {} свидетельств", decisions.len()),
+            format!(
+                "нет уверенных позиций среди {} свидетельств",
+                decisions.len()
+            ),
         );
     }
     let sup = acts.iter().find(|d| d.stance == Stance::Support);
@@ -375,6 +410,32 @@ pub fn aggregate(decisions: &[Decision]) -> Decision {
         ),
         (None, None) => Decision::neutral("lexical:aggregate", "нет позиций"),
     }
+}
+
+/// Есть ли среди оценок действующие вердикты обоих знаков (литература спорит).
+pub fn stance_conflict(decisions: &[Decision]) -> bool {
+    let sup = decisions
+        .iter()
+        .any(|d| d.acts() && d.stance == Stance::Support);
+    let con = decisions
+        .iter()
+        .any(|d| d.acts() && d.stance == Stance::Contradict);
+    sup && con
+}
+
+/// Итог двух судей: LLM перекрывает лексику **только** своим действующим вердиктом.
+/// Если LLM молчит (нейтраль/низкая уверенность), остаётся лексическое решение —
+/// так лексика не теряется там, где она была права, а LLM не тянет за собой шум.
+pub fn aggregate_with(lexical: &Decision, llm: &[Decision]) -> Decision {
+    let llm_dec = aggregate(llm);
+    if llm_dec.acts() {
+        return llm_dec;
+    }
+    if lexical.acts() {
+        return lexical.clone();
+    }
+    // оба молчат: показываем причину LLM (она информативнее «нет уверенных позиций»)
+    llm_dec
 }
 
 #[cfg(test)]
@@ -505,6 +566,43 @@ mod tests {
             d.reason
         );
         assert!(!d.reason.contains("якорей 1/11"), "{}", d.reason);
+    }
+
+    #[test]
+    fn aggregate_with_llm_overrides_only_when_it_acts() {
+        let lexical_neutral = Decision::neutral("lexical", "позиции нет");
+        let lex_sup = Decision {
+            stance: Stance::Support,
+            confidence: 0.8,
+            source: "lexical",
+            reason: "l".into(),
+        };
+        let llm_con = Decision {
+            stance: Stance::Contradict,
+            confidence: 0.9,
+            source: "llm",
+            reason: "c".into(),
+        };
+        let llm_low = Decision {
+            stance: Stance::Support,
+            confidence: 0.4,
+            source: "llm",
+            reason: "low".into(),
+        };
+        // LLM действует → он главный
+        assert_eq!(
+            aggregate_with(&lexical_neutral, &[llm_con.clone()]).stance,
+            Stance::Contradict
+        );
+        // LLM молчит → остаётся лексика
+        assert_eq!(aggregate_with(&lex_sup, &[llm_low]).stance, Stance::Support);
+        // оба молчат → нейтраль
+        assert_eq!(
+            aggregate_with(&lexical_neutral, &[]).stance,
+            Stance::Neutral
+        );
+        // конфликт знаков → воздержание
+        assert!(stance_conflict(&[llm_con, lex_sup]));
     }
 
     #[test]

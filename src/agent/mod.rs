@@ -2517,7 +2517,11 @@ mod tests {
         assert_eq!(q2.effects.len(), 2, "notify + watchdog-report");
         assert_eq!(q2.effects[0].status, crate::effects::EffectStatus::Done);
         // watchdog-report — вид report, payload.kind = "watchdog"
-        let wd = q2.effects.iter().find(|e| e.kind == EffectKind::Report).unwrap();
+        let wd = q2
+            .effects
+            .iter()
+            .find(|e| e.kind == EffectKind::Report)
+            .unwrap();
         assert_eq!(wd.payload["kind"], serde_json::json!("watchdog"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2584,7 +2588,10 @@ mod tests {
         };
         let mut mem = crate::memory::Memory::load(&dir);
         let prompt = loop_.build_prompt("тест", &mut mem, &[]);
-        assert!(prompt.contains("### attention"), "внимание должно быть в промпте");
+        assert!(
+            prompt.contains("### attention"),
+            "внимание должно быть в промпте"
+        );
         assert!(prompt.contains("нужно пополнить ключ API"));
         let _ = std::fs::remove_dir_all(&dir);
     }

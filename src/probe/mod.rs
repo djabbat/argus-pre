@@ -34,13 +34,46 @@ pub trait Searcher {
 /// Короткий запрос из текста вопроса: убрать знаки, служебные слова, обрезать.
 pub fn build_query(question: &str) -> String {
     let stop = [
-        "держит", "ли", "падает", "ниже", "сходится", "достаточно", "нужен", "нужна", "есть",
-        "было", "были", "будет", "чем", "что", "как", "для", "при", "или", "the", "is", "are",
-        "does", "do", "can", "a", "an", "of", "in", "on", "to",
+        "держит",
+        "ли",
+        "падает",
+        "ниже",
+        "сходится",
+        "достаточно",
+        "нужен",
+        "нужна",
+        "есть",
+        "было",
+        "были",
+        "будет",
+        "чем",
+        "что",
+        "как",
+        "для",
+        "при",
+        "или",
+        "the",
+        "is",
+        "are",
+        "does",
+        "do",
+        "can",
+        "a",
+        "an",
+        "of",
+        "in",
+        "on",
+        "to",
     ];
     let cleaned: String = question
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' || c == '/' || c == ' ' { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' || c == '/' || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect();
     let words: Vec<String> = cleaned
         .split_whitespace()
@@ -77,7 +110,9 @@ fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -108,7 +143,10 @@ impl Searcher for EpMcSearcher {
             let mut attempt = 0u32;
             let resp = loop {
                 match client.get(&url).send() {
-                    Ok(r) if crate::verify::should_retry(r.status().as_u16()) && attempt < self.retries => {
+                    Ok(r)
+                        if crate::verify::should_retry(r.status().as_u16())
+                            && attempt < self.retries =>
+                    {
                         std::thread::sleep(std::time::Duration::from_millis(
                             crate::verify::backoff_ms(attempt),
                         ));
@@ -162,7 +200,11 @@ pub fn parse_epmc_candidates(body: &str, source: &str) -> Vec<Candidate> {
         .and_then(|r| r.as_array());
     let Some(arr) = arr else { return out };
     for r in arr {
-        let title = r.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let title = r
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
         let pmid = r.get("pmid").and_then(|t| t.as_str()).unwrap_or("");
         let doi = r.get("doi").and_then(|t| t.as_str()).unwrap_or("");
         let id = if !pmid.is_empty() {
@@ -245,7 +287,9 @@ impl Searcher for CorpusSearcher {
         }
         let mut out: Vec<(usize, Candidate)> = Vec::new();
         for f in files {
-            let Ok(text) = fs::read_to_string(&f) else { continue };
+            let Ok(text) = fs::read_to_string(&f) else {
+                continue;
+            };
             let low = text.to_lowercase();
             let hits = wanted.iter().filter(|w| low.contains(w.as_str())).count();
             if hits == 0 {
@@ -278,7 +322,6 @@ impl Searcher for CorpusSearcher {
     }
 }
 
-
 /// Запрос для англоязычной базы (Europe PMC): оставляем только латиницу/цифры,
 /// потому что русские слова дают 0 попаданий и цикл пишет «пробел» там, где пробел — артефакт запроса.
 pub fn build_query_en(question: &str) -> String {
@@ -296,7 +339,9 @@ pub fn build_query_en(question: &str) -> String {
             .collect();
         // «fiducial-autofocus» → два слова: база ищет по AND и составное слово не находит
         for part in cleaned.split(['-', '/', '.', ':']) {
-            let w = part.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_string();
+            let w = part
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_string();
             if w.chars().count() < 3 {
                 continue;
             }
@@ -317,33 +362,113 @@ pub fn build_query_en(question: &str) -> String {
     }
     words.sort_by_key(|w| {
         let tech = w.chars().any(|c| c.is_ascii_digit()) || w.contains('-') || w.contains('/');
-        if tech { 0 } else { 1 }
+        if tech {
+            0
+        } else {
+            1
+        }
     });
     words.truncate(MAX_QUERY_WORDS);
     words.join(" ")
 }
 
 /// Выбор запроса под канал: `epmc` — латиница, остальные — общий cleaner.
+/// Мини-глоссарий темы → английские термины для запроса.
+///
+/// Зачем: литература по нашим темам английская, а вопросы — русские. `build_query_en`
+/// вытаскивает только латиницу, и вопрос «Показано ли, что fiducial-автофокус удерживает
+/// дрейф < 1 px за 24 ч…» превращался в запрос из одного слова `fiducial` — Europe PMC
+/// возвращал работы про рентгеновские фидуциалы в лучевой терапии. Ключ — префикс
+/// (стем), значение — термин, который реально ищется в базе.
+const GLOSSARY: [(&str, &str); 46] = [
+    ("автофокус", "autofocus"),
+    ("фокус", "focus"),
+    ("дрейф", "drift"),
+    ("центриол", "centriole"),
+    ("фибробласт", "fibroblast"),
+    ("делен", "division"),
+    ("деления", "division"),
+    ("интервал", "interval"),
+    ("фототоксич", "phototoxicity"),
+    ("съёмк", "imaging"),
+    ("съемк", "imaging"),
+    ("изображен", "imaging"),
+    ("микроскоп", "microscope"),
+    ("точность", "accuracy"),
+    ("разрешен", "resolution"),
+    ("локализац", "localization"),
+    ("асимметр", "asymmetry"),
+    ("дочерн", "daughter"),
+    ("размер", "size"),
+    ("расстоян", "distance"),
+    ("электронн", "electron"),
+    ("иммортализ", "immortalized"),
+    ("вариабельн", "variability"),
+    ("распределен", "distribution"),
+    ("логнормальн", "lognormal"),
+    ("экспоненциальн", "exponential"),
+    ("трекер", "tracker"),
+    ("линий", "lineage"),
+    ("линия", "line"),
+    ("ошибка", "error"),
+    ("кадр", "frame"),
+    ("доза", "dose"),
+    ("сутки", "day"),
+    ("конфокальн", "confocal"),
+    ("контрол", "control"),
+    ("скорост", "rate"),
+    ("крупн", "size"),
+    ("зрел", "mature"),
+    ("стар", "old"),
+    ("метк", "marker"),
+    ("меток", "marker"),
+    ("длительн", "long-term"),
+    ("непрерывн", "continuous"),
+    ("числ", "number"),
+    ("моноклональн", "clonal"),
+    ("пролиферац", "proliferation"),
+];
+
+/// Перевести русские термины вопроса в английские ключи (для литературного канала).
+pub fn glossary_terms(question: &str) -> Vec<String> {
+    let low = question.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    for (ru, en) in GLOSSARY {
+        if low.contains(ru) && !out.iter().any(|w| w == en) {
+            out.push(en.to_string());
+        }
+    }
+    out
+}
+
 pub fn build_query_for(channel: &str, question: &str) -> String {
     if channel == "epmc" {
-        let en = build_query_en(question);
-        if !en.trim().is_empty() {
-            return en;
+        let mut words: Vec<String> = build_query_en(question)
+            .split_whitespace()
+            .map(|w| w.to_string())
+            .collect();
+        // латиницы мало (русский вопрос) → добавляем глоссарий темы
+        if words.len() < 3 {
+            for t in glossary_terms(question) {
+                if !words.iter().any(|w| w.eq_ignore_ascii_case(&t)) {
+                    words.push(t);
+                }
+            }
+        }
+        let q = words.join(" ");
+        if !q.trim().is_empty() {
+            return q;
         }
     }
     build_query(question)
 }
-
 
 /// Отсев нерелевантного: поиск отдаёт «что угодно, лишь бы совпало слово».
 /// Без этого фильтра `identifier_resolution_rate` можно получить 1.00 на мусоре —
 /// ровно та ошибка «приёмник выдумывает сигнал», против которой построен гейт.
 /// Длина общего префикса (для грубого стемминга без внешних крейтов).
 fn common_prefix_len(a: &str, b: &str) -> usize {
-    a.chars()
-        .zip(b.chars())
-        .take_while(|(x, y)| x == y)
-        .count()
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
 pub fn filter_relevant(query: &str, cands: Vec<Candidate>) -> (Vec<Candidate>, Vec<Candidate>) {
@@ -366,10 +491,7 @@ pub fn filter_relevant(query: &str, cands: Vec<Candidate>) -> (Vec<Candidate>, V
             .collect();
         // точное вхождение ИЛИ общий префикс ≥5 символов: «Centrin1» ↔ «Centriole»
         let hit = terms.iter().any(|w| {
-            t.contains(w.as_str())
-                || title_words
-                    .iter()
-                    .any(|tw| common_prefix_len(w, tw) >= 5)
+            t.contains(w.as_str()) || title_words.iter().any(|tw| common_prefix_len(w, tw) >= 5)
         });
         if hit {
             kept.push(c);
@@ -380,11 +502,13 @@ pub fn filter_relevant(query: &str, cands: Vec<Candidate>) -> (Vec<Candidate>, V
     (kept, dropped)
 }
 
-
 /// Лестница запросов: база склеивает слова через AND, поэтому узкий запрос даёт 0 попаданий.
 /// Идём от полного к короткому и берём первый непустой результат.
 pub fn query_ladder(query: &str) -> Vec<String> {
-    let words: Vec<&str> = query.split_whitespace().filter(|w| w.chars().count() > 2).collect();
+    let words: Vec<&str> = query
+        .split_whitespace()
+        .filter(|w| w.chars().count() > 2)
+        .collect();
     let mut out: Vec<String> = Vec::new();
     for n in (1..=words.len()).rev() {
         let q = words[..n].join(" ");
@@ -397,7 +521,6 @@ pub fn query_ladder(query: &str) -> Vec<String> {
     }
     out
 }
-
 
 /// Пересечение стемов как **доля запроса**: |Q∩T| / |Q|, стем = первые 5 символов.
 /// Доля запроса, а не косинус: длинный заголовок иначе «разбавляет» единственное совпадение
@@ -475,11 +598,34 @@ mod tests {
 
     #[test]
     fn build_query_strips_question_marks_and_stopwords() {
-        let q = build_query("Держит ли fiducial-autofocus дрейф < 1 px за 72 ч на OpenFlexure (P0)?");
+        let q =
+            build_query("Держит ли fiducial-autofocus дрейф < 1 px за 72 ч на OpenFlexure (P0)?");
         assert!(!q.contains('?'));
         assert!(!q.to_lowercase().contains("ли "));
         assert!(q.contains("fiducial-autofocus"), "{q}");
         assert!(q.split_whitespace().count() <= MAX_QUERY_WORDS);
+    }
+
+    #[test]
+    fn glossary_turns_russian_question_into_english_query() {
+        let q = build_query_for(
+            "epmc",
+            "Показано ли, что fiducial-автофокус удерживает дрейф фокуса < 1 px за 24 ч на открытом микроскопе?",
+        );
+        for term in ["fiducial", "autofocus", "drift", "focus", "microscope"] {
+            assert!(q.contains(term), "нет «{term}» в запросе «{q}»");
+        }
+        assert!(
+            q.split_whitespace().count() > 1,
+            "запрос не должен схлопываться в одно слово: «{q}»"
+        );
+    }
+
+    #[test]
+    fn glossary_does_not_override_english_question() {
+        let q = build_query_for("epmc", "centriole pair distance electron microscopy human fibroblasts");
+        assert!(q.contains("centriole"));
+        assert!(!q.contains("daughter"), "глоссарий не должен примешиваться: «{q}»");
     }
 
     #[test]
@@ -546,8 +692,18 @@ mod tests {
     fn relevance_filter_drops_titles_without_query_terms() {
         let q = "fiducial-autofocus drift OpenFlexure";
         let cands = vec![
-            Candidate { id: "PMID:1".into(), title: "Fiducial markers for autofocus drift correction".into(), source: "e".into(), abstract_text: None },
-            Candidate { id: "PMID:2".into(), title: "Biochar improves the nutrient cycle in soils".into(), source: "e".into(), abstract_text: None },
+            Candidate {
+                id: "PMID:1".into(),
+                title: "Fiducial markers for autofocus drift correction".into(),
+                source: "e".into(),
+                abstract_text: None,
+            },
+            Candidate {
+                id: "PMID:2".into(),
+                title: "Biochar improves the nutrient cycle in soils".into(),
+                source: "e".into(),
+                abstract_text: None,
+            },
         ];
         let (kept, dropped) = filter_relevant(q, cands);
         assert_eq!(dropped.len(), 1);
@@ -596,10 +752,22 @@ mod tests {
     fn relevance_scores_separate_topics() {
         let q = "Centrin1 GFP SAS mCherry";
         let cases = [
-            ("Centriole and PCM cooperatively recruit CEP192 to spindle poles", true),
-            ("An extended DNA-free intranuclear compartment organizes centrosome microtubules", true),
-            ("Ciliogenesis is regulated by a huntingtin-HAP1-PCM1 pathway", false),
-            ("NuMA assemblies organize microtubule asters to establish spindle bipolarity", false),
+            (
+                "Centriole and PCM cooperatively recruit CEP192 to spindle poles",
+                true,
+            ),
+            (
+                "An extended DNA-free intranuclear compartment organizes centrosome microtubules",
+                true,
+            ),
+            (
+                "Ciliogenesis is regulated by a huntingtin-HAP1-PCM1 pathway",
+                false,
+            ),
+            (
+                "NuMA assemblies organize microtubule asters to establish spindle bipolarity",
+                false,
+            ),
             ("Biochar improves the nutrient cycle in sandy soils", false),
         ];
         for (title, want) in cases {

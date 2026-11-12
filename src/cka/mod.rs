@@ -73,7 +73,10 @@ impl Vectorizer for WordHashVec {
     fn embed(&self, text: &str) -> Vec<f32> {
         let mut v = vec![0f32; self.dim];
         let low = text.to_lowercase();
-        let words: Vec<&str> = low.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+        let words: Vec<&str> = low
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
         for w in &words {
             v[self.idx(w)] += 1.0;
         }
@@ -163,7 +166,11 @@ pub fn gram(x: &[Vec<f64>]) -> Vec<Vec<f64>> {
 }
 
 fn frob(a: &[Vec<f64>]) -> f64 {
-    a.iter().flat_map(|r| r.iter()).map(|v| v * v).sum::<f64>().sqrt()
+    a.iter()
+        .flat_map(|r| r.iter())
+        .map(|v| v * v)
+        .sum::<f64>()
+        .sqrt()
 }
 
 fn inner(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
@@ -189,8 +196,14 @@ pub fn cka_from_grams(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
 
 /// CKA по двум наборам представлений.
 pub fn cka(x: &[Vec<f32>], y: &[Vec<f32>]) -> f64 {
-    let xf: Vec<Vec<f64>> = x.iter().map(|r| r.iter().map(|v| *v as f64).collect()).collect();
-    let yf: Vec<Vec<f64>> = y.iter().map(|r| r.iter().map(|v| *v as f64).collect()).collect();
+    let xf: Vec<Vec<f64>> = x
+        .iter()
+        .map(|r| r.iter().map(|v| *v as f64).collect())
+        .collect();
+    let yf: Vec<Vec<f64>> = y
+        .iter()
+        .map(|r| r.iter().map(|v| *v as f64).collect())
+        .collect();
     cka_from_grams(&gram(&xf), &gram(&yf))
 }
 
@@ -226,8 +239,14 @@ pub struct PermTest {
 /// Перестановочный тест: нулевая гипотеза — соответствие объектов между X и Y случайно.
 pub fn permutation_test(x: &[Vec<f32>], y: &[Vec<f32>], perms: usize, seed: u64) -> PermTest {
     let n = x.len().min(y.len());
-    let xf: Vec<Vec<f64>> = x[..n].iter().map(|r| r.iter().map(|v| *v as f64).collect()).collect();
-    let yf: Vec<Vec<f64>> = y[..n].iter().map(|r| r.iter().map(|v| *v as f64).collect()).collect();
+    let xf: Vec<Vec<f64>> = x[..n]
+        .iter()
+        .map(|r| r.iter().map(|v| *v as f64).collect())
+        .collect();
+    let yf: Vec<Vec<f64>> = y[..n]
+        .iter()
+        .map(|r| r.iter().map(|v| *v as f64).collect())
+        .collect();
     let a = gram(&xf);
     let b = gram(&yf);
     let observed = cka_from_grams(&a, &b);
@@ -320,7 +339,9 @@ mod tests {
             "language models compute only after a prompt and waste idle time between turns",
             "senescent cells accumulate damage and change nuclear morphology visibly",
         ];
-        (0..n).map(|i| format!("{} {}", topics[i % topics.len()], i)).collect()
+        (0..n)
+            .map(|i| format!("{} {}", topics[i % topics.len()], i))
+            .collect()
     }
 
     #[test]
@@ -339,7 +360,10 @@ mod tests {
         let x: Vec<Vec<f32>> = items.iter().map(|t| a.embed(t)).collect();
         let y: Vec<Vec<f32>> = items.iter().map(|t| b.embed(t)).collect();
         let t = permutation_test(&x, &y, 200, 42);
-        assert!(t.observed > t.null_p95, "наблюдаемая CKA должна быть выше 95% нуля: {t:?}");
+        assert!(
+            t.observed > t.null_p95,
+            "наблюдаемая CKA должна быть выше 95% нуля: {t:?}"
+        );
         assert!(t.p_value <= 0.05, "p={} ({t:?})", t.p_value);
     }
 
@@ -419,7 +443,8 @@ impl RatingsVec {
     }
 
     fn call_once(&self, text: &str, attempt: u32) -> Vec<f32> {
-        let url = std::env::var("ARGUS_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
+        let url =
+            std::env::var("ARGUS_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
         let client = match reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
@@ -440,7 +465,11 @@ impl RatingsVec {
             "stream": false,
             "options": { "temperature": 0, "num_predict": 60 }
         });
-        let resp = match client.post(format!("{url}/api/generate")).json(&body).send() {
+        let resp = match client
+            .post(format!("{url}/api/generate"))
+            .json(&body)
+            .send()
+        {
             Ok(r) => r,
             Err(_) => return vec![],
         };
@@ -521,8 +550,14 @@ mod ratings_tests {
 
     #[test]
     fn rejects_incomplete_or_out_of_range() {
-        assert!(parse_ratings("7, 9, 8", 8).is_empty(), "меньше 8 чисел — брак");
-        assert!(parse_ratings("7,9,8,2,5,1,6,99", 8).is_empty(), "99 вне диапазона");
+        assert!(
+            parse_ratings("7, 9, 8", 8).is_empty(),
+            "меньше 8 чисел — брак"
+        );
+        assert!(
+            parse_ratings("7,9,8,2,5,1,6,99", 8).is_empty(),
+            "99 вне диапазона"
+        );
     }
 
     #[test]
@@ -626,7 +661,12 @@ mod embed_tests {
     #[test]
     fn cka_is_one_for_identical_encoder_output() {
         // два «энкодера» с одинаковыми векторами: CKA обязана быть 1.0
-        let xs = vec![vec![0.1f32, 0.5, 0.2], vec![0.3, 0.1, 0.9], vec![0.7, 0.2, 0.4], vec![0.2, 0.8, 0.1]];
+        let xs = vec![
+            vec![0.1f32, 0.5, 0.2],
+            vec![0.3, 0.1, 0.9],
+            vec![0.7, 0.2, 0.4],
+            vec![0.2, 0.8, 0.1],
+        ];
         assert!((cka(&xs, &xs) - 1.0).abs() < 1e-6);
     }
 }

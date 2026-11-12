@@ -144,7 +144,11 @@ mod tests {
     #[test]
     fn short_gap_is_not_downtime() {
         let (do_now, missed, _) = plan_catchup(Some(&ago(30)), 60, 20, 10);
-        assert_eq!((do_now, missed), (0, 0), "30 с при интервале 60 — норма, не простой");
+        assert_eq!(
+            (do_now, missed),
+            (0, 0),
+            "30 с при интервале 60 — норма, не простой"
+        );
     }
 
     #[test]

@@ -177,9 +177,21 @@ impl Cache {
     /// Только `Resolved` остаётся пригодным навсегда (существование ID не протухает);
     /// `Unverified` перепроверяем после TTL, `NotFound` — тоже (ID могли доиндексировать).
     pub fn stats(&self) -> (usize, usize, usize) {
-        let r = self.entries.values().filter(|e| e.status == Status::Resolved).count();
-        let n = self.entries.values().filter(|e| e.status == Status::NotFound).count();
-        let u = self.entries.values().filter(|e| e.status == Status::Unverified).count();
+        let r = self
+            .entries
+            .values()
+            .filter(|e| e.status == Status::Resolved)
+            .count();
+        let n = self
+            .entries
+            .values()
+            .filter(|e| e.status == Status::NotFound)
+            .count();
+        let u = self
+            .entries
+            .values()
+            .filter(|e| e.status == Status::Unverified)
+            .count();
         (r, n, u)
     }
 }
@@ -259,7 +271,10 @@ impl Fetcher for HttpFetcher {
         };
         let code = resp.status().as_u16();
         if code == 429 {
-            return Err(format!("rate limited (429) после {} попыток", self.retries + 1));
+            return Err(format!(
+                "rate limited (429) после {} попыток",
+                self.retries + 1
+            ));
         }
         if code == 404 {
             return Ok(None);
@@ -290,7 +305,11 @@ pub fn parse_epmc_hit(body: &str) -> Option<Meta> {
     }
     let r = v.get("resultList")?.get("result")?.get(0)?;
     Some(Meta {
-        title: r.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        title: r
+            .get("title")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         container: r
             .get("journalTitle")
             .and_then(|x| x.as_str())
@@ -334,8 +353,8 @@ pub fn parse_arxiv(body: &str) -> Option<Meta> {
     let entry_start = body.find("<entry")?;
     let tail = &body[entry_start..];
     let title = extract_tag(tail, "title")?;
-    let year = extract_tag(tail, "published")
-        .and_then(|p| p.get(..4).and_then(|y| y.parse::<i32>().ok()));
+    let year =
+        extract_tag(tail, "published").and_then(|p| p.get(..4).and_then(|y| y.parse::<i32>().ok()));
     Some(Meta {
         title: title.split_whitespace().collect::<Vec<_>>().join(" "),
         container: "arXiv".to_string(),
@@ -418,18 +437,28 @@ mod tests {
     }
 
     fn cache_tmp(name: &str) -> Cache {
-        let dir = std::env::temp_dir().join(format!("argus-verify-test-{}-{}", name, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("argus-verify-test-{}-{}", name, std::process::id()));
         Cache::load(&dir)
     }
 
     #[test]
     fn parses_three_id_kinds() {
         assert_eq!(Id::parse("PMID:23663408").unwrap().kind, IdKind::Pmid);
-        assert_eq!(Id::parse("doi:10.1017/S0140525X19000049").unwrap().kind, IdKind::Doi);
+        assert_eq!(
+            Id::parse("doi:10.1017/S0140525X19000049").unwrap().kind,
+            IdKind::Doi
+        );
         assert_eq!(Id::parse("arXiv:2504.13171").unwrap().kind, IdKind::Arxiv);
         assert!(Id::parse("PMID:12").is_none(), "слишком короткий PMID");
-        assert!(Id::parse("10.1017/S0140525X19000049").is_none(), "без префикса — не ID");
-        assert_eq!(Id::parse("arXiv:2504.13171").unwrap().key(), "arXiv:2504.13171");
+        assert!(
+            Id::parse("10.1017/S0140525X19000049").is_none(),
+            "без префикса — не ID"
+        );
+        assert_eq!(
+            Id::parse("arXiv:2504.13171").unwrap().key(),
+            "arXiv:2504.13171"
+        );
     }
 
     #[test]
@@ -466,7 +495,11 @@ Scaling</title><published>2025-04-16T00:00:00Z</published></entry></feed>"#;
         assert_eq!(e1.status, Status::Resolved);
         let e2 = resolve(&id, &mut c, &f);
         assert_eq!(e2.status, Status::Resolved);
-        assert_eq!(f.calls.borrow().len(), 1, "второй вызов должен прийти из кэша");
+        assert_eq!(
+            f.calls.borrow().len(),
+            1,
+            "второй вызов должен прийти из кэша"
+        );
     }
 
     #[test]
@@ -480,7 +513,10 @@ Scaling</title><published>2025-04-16T00:00:00Z</published></entry></feed>"#;
         let missing = Id::parse("doi:10.9999/nope").unwrap();
         let e = resolve(&missing, &mut c, &f);
         assert_eq!(e.status, Status::NotFound);
-        assert_eq!(to_ledger_verifier(&[e]), crate::ledger::VerifyResult::Fabricated);
+        assert_eq!(
+            to_ledger_verifier(&[e]),
+            crate::ledger::VerifyResult::Fabricated
+        );
 
         let mut c2 = cache_tmp("cls2");
         let f2 = FakeFetcher {
@@ -491,7 +527,10 @@ Scaling</title><published>2025-04-16T00:00:00Z</published></entry></feed>"#;
         let id = Id::parse("PMID:23663408").unwrap();
         let e2 = resolve(&id, &mut c2, &f2);
         assert_eq!(e2.status, Status::Unverified);
-        assert_eq!(to_ledger_verifier(&[e2]), crate::ledger::VerifyResult::Unresolved);
+        assert_eq!(
+            to_ledger_verifier(&[e2]),
+            crate::ledger::VerifyResult::Unresolved
+        );
     }
 
     #[test]
@@ -507,14 +546,20 @@ Scaling</title><published>2025-04-16T00:00:00Z</published></entry></feed>"#;
             Id::parse("doi:10.9999/nope").unwrap(),
         ];
         let es = resolve_many(&ids, &mut c, &f);
-        assert_eq!(to_ledger_verifier(&es), crate::ledger::VerifyResult::Fabricated);
+        assert_eq!(
+            to_ledger_verifier(&es),
+            crate::ledger::VerifyResult::Fabricated
+        );
     }
 
     #[test]
     fn retry_policy_and_backoff_are_bounded() {
         assert!(should_retry(429));
         assert!(should_retry(503));
-        assert!(!should_retry(404), "404 — это не временная ошибка, а «не существует»");
+        assert!(
+            !should_retry(404),
+            "404 — это не временная ошибка, а «не существует»"
+        );
         assert!(!should_retry(200));
         assert_eq!(backoff_ms(0), 500);
         assert_eq!(backoff_ms(1), 1000);

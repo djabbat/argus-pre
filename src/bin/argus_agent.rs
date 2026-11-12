@@ -2,10 +2,10 @@
 //! Паттерны: P1 (цикл + реальная LLM), P2 (файловая память), P4 (режимы-сессия).
 use argus_pre::agent::{AgentLoop, LlmConfig, LlmModel, LoopConfig, Mode, StubModel};
 use argus_pre::ledger::{self, Ledger, Outcome};
+use argus_pre::memory::{Memory, NoteKind};
 use argus_pre::probe::{self, CorpusSearcher, EpMcSearcher, Searcher};
 use argus_pre::stance;
 use argus_pre::verify::{self, Cache, HttpFetcher};
-use argus_pre::memory::{Memory, NoteKind};
 use std::path::PathBuf;
 
 fn state_dir() -> PathBuf {
@@ -63,7 +63,7 @@ fn main() {
   ticket list/show          P8a: единицы авторизованной работы (Ticket+Mandate)
   policy show/set           P8a: версионированные правила допуска (accept mode off/observe/auto)
   think [--once|--loop|--dry-run] [--probe epmc|corpus|none] [--corpus DIR]
-        [--limit N] [--min-score 0.20] [--offline] [--judge auto|support|contradict|off]
+        [--limit N] [--min-score 0.20] [--offline] [--judge auto|lexical|hybrid|llm|support|contradict|off]
         [--qid <id>] [--seed N] [--k N]
         [--loop --max-cycles N --interval-secs N --budget-cycles N --budget-tokens N --quiet]
         [--report [--write] [--hours N]]
@@ -584,7 +584,9 @@ fn cmd_serve(args: &[String], sdir: &std::path::Path) {
         let _ = argus_pre::skills::serve(&sdir2, port);
     });
     // основной поток: планировщик задач + периодический тик effects (P8d)
-    println!("🟢 daemon: skill hub :{port} + задачи каждые {tick}с + effects тик (Ctrl+C для выхода)");
+    println!(
+        "🟢 daemon: skill hub :{port} + задачи каждые {tick}с + effects тик (Ctrl+C для выхода)"
+    );
     loop {
         let n = run_due_tasks(sdir, true);
         if n > 0 {
@@ -860,7 +862,11 @@ fn cmd_ticket(args: &[String], sdir: &std::path::Path) {
                 println!("(tickets нет — run создаёт Ticket через gate)");
             }
             for t in &store.tickets {
-                let st = if t.status == TicketStatus::Open { "🟡 open" } else { "✅ ended" };
+                let st = if t.status == TicketStatus::Open {
+                    "🟡 open"
+                } else {
+                    "✅ ended"
+                };
                 println!(
                     "#{:<4} {} [{}] scope={} rules={} origin={} — {}",
                     t.id,
@@ -880,9 +886,13 @@ fn cmd_ticket(args: &[String], sdir: &std::path::Path) {
                     println!("Ticket #{}", t.id);
                     println!("  goal: {}", t.goal);
                     println!("  статус: {:?}", t.status);
-                    println!("  mandate: policy={} strength={} scope={} rules={}",
-                        t.mandate.policy_version, t.mandate.strength.name(),
-                        t.mandate.scope, t.mandate.matched_rules.join(","));
+                    println!(
+                        "  mandate: policy={} strength={} scope={} rules={}",
+                        t.mandate.policy_version,
+                        t.mandate.strength.name(),
+                        t.mandate.scope,
+                        t.mandate.matched_rules.join(",")
+                    );
                     println!("  origin: {}", t.mandate.origin);
                     println!("  created: {}", t.created_at);
                     if let Some(o) = &t.outcome {
@@ -947,7 +957,14 @@ fn cmd_policy(args: &[String], sdir: &std::path::Path) {
                 } else if disable {
                     r.enabled = false;
                 }
-                println!("✅ правило '{rid}' → {}", if enable { "включено" } else { "отключено" });
+                println!(
+                    "✅ правило '{rid}' → {}",
+                    if enable {
+                        "включено"
+                    } else {
+                        "отключено"
+                    }
+                );
             }
             p.recompute_version();
             p.updated_at = chrono::Local::now().to_rfc3339();
@@ -959,7 +976,10 @@ fn cmd_policy(args: &[String], sdir: &std::path::Path) {
             if stale.is_empty() {
                 println!("ℹ️ открытых tickets с устаревшим мандатом нет");
             } else {
-                println!("🔔 смена Policy затронула {} открытых ticket(ов):", stale.len());
+                println!(
+                    "🔔 смена Policy затронула {} открытых ticket(ов):",
+                    stale.len()
+                );
                 for (id, goal) in &stale {
                     println!("   - #{id}: {}", goal.chars().take(60).collect::<String>());
                 }
@@ -980,10 +1000,15 @@ fn cmd_policy(args: &[String], sdir: &std::path::Path) {
                     }),
                 );
                 q.save(sdir);
-                println!("📨 notify-эффект поставлен в очередь effects (key=policy-changed:{})", p.version);
+                println!(
+                    "📨 notify-эффект поставлен в очередь effects (key=policy-changed:{})",
+                    p.version
+                );
             }
         }
-        _ => println!("policy: show | set --mode off|observe|auto [--rule <id> --enable|--disable]"),
+        _ => {
+            println!("policy: show | set --mode off|observe|auto [--rule <id> --enable|--disable]")
+        }
     }
 }
 
@@ -1805,7 +1830,6 @@ fn make_starter_skills(sdir: &std::path::Path) -> usize {
     n
 }
 
-
 // ───────────────────────────── P9: idle inference ─────────────────────────────
 // Спека: _gh/ARGUS-OS1/docs/ARGUS_Internal_Process_Idle_Inference_2026-11-12.md
 // M1: леджер + выбор вопроса + запись цикла. Проб нет: инструменты появятся в M2.
@@ -1823,7 +1847,6 @@ fn arg_str(args: &[String], key: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1))
         .cloned()
 }
-
 
 // ── M4-фикс: защита от двух одновременных циклов (последняя запись затирала состояние) ──
 struct LoopLock {
@@ -1877,7 +1900,8 @@ struct ThinkCfg {
 
 fn parse_think_cfg(args: &[String], sdir: &PathBuf) -> ThinkCfg {
     ThinkCfg {
-        dry: args.iter().any(|a| a == "--dry-run") || !args.iter().any(|a| a == "--once" || a == "--loop"),
+        dry: args.iter().any(|a| a == "--dry-run")
+            || !args.iter().any(|a| a == "--once" || a == "--loop"),
         seed: arg_num(args, "--seed").unwrap_or(42),
         k: arg_num(args, "--k").unwrap_or(3) as usize,
         limit: arg_num(args, "--limit").unwrap_or(3) as usize,
@@ -1893,7 +1917,8 @@ fn parse_think_cfg(args: &[String], sdir: &PathBuf) -> ThinkCfg {
             .unwrap_or(0.20),
         quiet: args.iter().any(|a| a == "--quiet"),
         budget_cycles: arg_num(args, "--budget-cycles")
-            .unwrap_or(argus_pre::budget::DEFAULT_MAX_CYCLES_PER_HOUR as u64) as u32,
+            .unwrap_or(argus_pre::budget::DEFAULT_MAX_CYCLES_PER_HOUR as u64)
+            as u32,
         budget_tokens: arg_num(args, "--budget-tokens")
             .unwrap_or(argus_pre::budget::DEFAULT_MAX_TOKENS_PER_DAY),
         interval_secs: arg_num(args, "--interval-secs").unwrap_or(300),
@@ -1902,7 +1927,9 @@ fn parse_think_cfg(args: &[String], sdir: &PathBuf) -> ThinkCfg {
 
 fn select_question(cfg: &ThinkCfg, led: &Ledger) -> Result<ledger::Scored, String> {
     if let Some(id) = &cfg.qid {
-        let q = led.get(id).ok_or_else(|| format!("нет такого вопроса: {id}"))?;
+        let q = led
+            .get(id)
+            .ok_or_else(|| format!("нет такого вопроса: {id}"))?;
         return Ok(ledger::Scored {
             id: q.id.clone(),
             text: q.text.clone(),
@@ -1928,13 +1955,13 @@ fn run_cycle(
     let pick = select_question(cfg, led)?;
     let q = probe::build_query_for(&cfg.channel, &pick.text);
     if !cfg.quiet {
-        println!(
-            "\nвопрос: {} (seed={}) — {}",
-            pick.id, cfg.seed, pick.text
-        );
+        println!("\nвопрос: {} (seed={}) — {}", pick.id, cfg.seed, pick.text);
         println!("  канал: {} · запрос: «{}»", cfg.channel, q);
     }
 
+    // расход токенов LLM-судьи (идёт в дневной бюджет) и его заметка для журнала
+    let mut judge_tokens: u64 = 0;
+    let mut judge_note: Option<String> = None;
     let (outcome, ids, note, stance_dec) = match cfg.channel.as_str() {
         "epmc" | "corpus" => {
             let found = if cfg.channel == "epmc" {
@@ -2020,39 +2047,123 @@ fn run_cycle(
                         // 0.500 → 0.500 в каждом цикле (15/15 за ночь). Классификатор
                         // молчит, если нет якорей/маркеров или они конфликтуют;
                         // тогда исход остаётся Evidence и p не двигается.
-                        let stance_dec: Option<stance::Decision> = match (
-                            verdict,
-                            cfg.judge.as_deref(),
-                        ) {
-                            (ledger::VerifyResult::Resolved, None | Some("auto")) => {
-                                let ds: Vec<stance::Decision> = cands
-                                    .iter()
-                                    .map(|c| {
-                                        stance::classify(
+                        let stance_dec: Option<stance::Decision> =
+                            match (verdict, cfg.judge.as_deref()) {
+                                (ledger::VerifyResult::Resolved, Some("off")) => None,
+                                (
+                                    ledger::VerifyResult::Resolved,
+                                    None | Some("auto") | Some("lexical"),
+                                ) => {
+                                    let ds: Vec<stance::Decision> = cands
+                                        .iter()
+                                        .map(|c| {
+                                            stance::classify(
+                                                &pick.text,
+                                                &c.title,
+                                                c.abstract_text.as_deref().unwrap_or(""),
+                                            )
+                                        })
+                                        .collect();
+                                    if !cfg.quiet {
+                                        for (c, d) in cands.iter().zip(ds.iter()) {
+                                            println!(
+                                                "    stance {} {} ({:.2}, {}) — {}",
+                                                c.id,
+                                                d.stance.as_str(),
+                                                d.confidence,
+                                                d.source,
+                                                d.reason
+                                            );
+                                        }
+                                    }
+                                    Some(stance::aggregate(&ds))
+                                }
+                                (ledger::VerifyResult::Resolved, mode @ (Some("hybrid") | Some("llm"))) => {
+                                    // лексика считается всегда: она бесплатна и служит опорой
+                                    let ds: Vec<stance::Decision> = cands
+                                        .iter()
+                                        .map(|c| {
+                                            stance::classify(
+                                                &pick.text,
+                                                &c.title,
+                                                c.abstract_text.as_deref().unwrap_or(""),
+                                            )
+                                        })
+                                        .collect();
+                                    let lexical = stance::aggregate(&ds);
+                                    let is_prop = led
+                                        .get(&pick.id)
+                                        .map(|q| q.form().allows_lr())
+                                        .unwrap_or(false);
+                                    let want_llm = is_prop
+                                        && stance::llm::JudgeConfig::enabled()
+                                        && (mode == Some("llm") || !lexical.acts());
+                                    if !want_llm {
+                                        if !cfg.quiet {
+                                            println!(
+                                                "    stance lexical {} ({:.2}) — LLM не нужен{}",
+                                                lexical.stance.as_str(),
+                                                lexical.confidence,
+                                                if is_prop { "" } else { " (не претензия)" }
+                                            );
+                                        }
+                                        Some(lexical)
+                                    } else {
+                                        let mut cache = stance::llm::JudgeCache::load(sdir);
+                                        let items: Vec<stance::llm::Item<'_>> = cands
+                                            .iter()
+                                            .map(|c| stance::llm::Item {
+                                                id: c.id.as_str(),
+                                                title: c.title.as_str(),
+                                                abstract_text: c.abstract_text.as_deref().unwrap_or(""),
+                                            })
+                                            .collect();
+                                        let jcfg = stance::llm::JudgeConfig::from_env();
+                                        let out = stance::llm::judge_batch(
+                                            &jcfg,
+                                            &pick.id,
                                             &pick.text,
-                                            &c.title,
-                                            c.abstract_text.as_deref().unwrap_or(""),
-                                        )
-                                    })
-                                    .collect();
-                                if !cfg.quiet {
-                                    for (c, d) in cands.iter().zip(ds.iter()) {
-                                        println!(
-                                            "    stance {} {} ({:.2}, {}) — {}",
-                                            c.id,
-                                            d.stance.as_str(),
-                                            d.confidence,
-                                            d.source,
-                                            d.reason
+                                            &items,
+                                            &mut cache,
                                         );
+                                        if let Err(e) = cache.save(sdir) {
+                                            eprintln!("⚠️ кэш судьи не сохранён: {e}");
+                                        }
+                                        judge_tokens = out.tokens;
+                                        judge_note = Some(out.note.clone());
+                                        if !cfg.quiet {
+                                            println!("    {}", out.note);
+                                            for (c, d) in cands.iter().zip(out.decisions.iter()) {
+                                                println!(
+                                                    "    judge {} {} ({:.2}) — {}",
+                                                    c.id,
+                                                    d.stance.as_str(),
+                                                    d.confidence,
+                                                    d.reason
+                                                );
+                                            }
+                                            if stance::stance_conflict(&out.decisions) {
+                                                println!(
+                                                    "    ⚠️ свидетельства расходятся — воздержание"
+                                                );
+                                            }
+                                        }
+                                        Some(stance::aggregate_with(&lexical, &out.decisions))
                                     }
                                 }
-                                Some(stance::aggregate(&ds))
-                            }
-                            _ => None,
-                        };
+                                _ => None,
+                            };
                         let note = match &stance_dec {
-                            Some(d) => format!("{note} · stance {}/{}: {}", d.stance.as_str(), d.confidence, d.reason),
+                            Some(d) => format!(
+                                "{note} · stance {}/{}: {}",
+                                d.stance.as_str(),
+                                d.confidence,
+                                d.reason
+                            ),
+                            None => note,
+                        };
+                        let note = match &judge_note {
+                            Some(j) => format!("{note} · {j}"),
                             None => note,
                         };
                         let outcome = match verdict {
@@ -2061,7 +2172,9 @@ fn run_cycle(
                                 Some("support") => Outcome::Support,
                                 Some("contradict") => Outcome::Contradict,
                                 _ => match stance_dec.as_ref().filter(|d| d.acts()) {
-                                    Some(d) if d.stance == stance::Stance::Support => Outcome::Support,
+                                    Some(d) if d.stance == stance::Stance::Support => {
+                                        Outcome::Support
+                                    }
                                     Some(d) if d.stance == stance::Stance::Contradict => {
                                         Outcome::Contradict
                                     }
@@ -2095,7 +2208,7 @@ fn run_cycle(
             &format!("probe:{}", cfg.channel),
             ids,
             &note,
-            0,
+            judge_tokens,
             stance_dec.as_ref(),
         )
         .ok_or_else(|| "вопрос исчез из леджера".to_string())?;
@@ -2114,7 +2227,7 @@ fn run_cycle(
         );
         println!("  {note}");
     }
-    Ok((pick.id.clone(), note, 0))
+    Ok((pick.id.clone(), note, judge_tokens))
 }
 
 fn cmd_think(args: &[String], sdir: &PathBuf) {
@@ -2156,7 +2269,10 @@ fn cmd_think(args: &[String], sdir: &PathBuf) {
         match select_question(&cfg, &led) {
             Ok(p) => {
                 let q = probe::build_query_for(&cfg.channel, &p.text);
-                println!("\nвыбран: {} · канал {} · запрос «{}»", p.id, cfg.channel, q);
+                println!(
+                    "\nвыбран: {} · канал {} · запрос «{}»",
+                    p.id, cfg.channel, q
+                );
                 println!("--dry-run: ничего не записано. Записать: --once; фон: --loop");
             }
             Err(e) => println!("{e}"),
@@ -2230,7 +2346,10 @@ fn cmd_think(args: &[String], sdir: &PathBuf) {
             }
             // как сервис: не выходим, а ждём следующего окна бюджета (иначе systemd
             // перезапускает нас каждые 20 с и мы просто жжём циклы вхолостую)
-            println!("⏸ {why} — ждём окно бюджета ({} с)", cfg.interval_secs.max(10));
+            println!(
+                "⏸ {why} — ждём окно бюджета ({} с)",
+                cfg.interval_secs.max(10)
+            );
             std::thread::sleep(interval);
             continue;
         }
@@ -2319,22 +2438,50 @@ fn write_daily_report(sdir: &PathBuf, hours: Option<f64>) -> std::io::Result<Pat
     let _ = writeln!(s, "| циклов | {} |", m.cycles);
     let _ = writeln!(s, "| с идентификаторами | {} |", m.id_cycles);
     let _ = writeln!(s, "| пробелов (ничего не найдено) | {} |", m.gap_cycles);
-    let _ = writeln!(s, "| resolved / unresolved / fabricated | {} / {} / {} |", m.resolved, m.unresolved, m.fabricated);
-    let _ = writeln!(s, "| identifier_resolution_rate | {:.2} |", m.identifier_resolution_rate);
+    let _ = writeln!(
+        s,
+        "| resolved / unresolved / fabricated | {} / {} / {} |",
+        m.resolved, m.unresolved, m.fabricated
+    );
+    let _ = writeln!(
+        s,
+        "| identifier_resolution_rate | {:.2} |",
+        m.identifier_resolution_rate
+    );
     let _ = writeln!(s, "| evidence_yield | {:.2} |", m.evidence_yield);
-    let _ = writeln!(s, "| fabricated_identifiers | {} |", m.fabricated_identifiers);
-    let _ = writeln!(s, "| mean_abs_logit_shift | {:.3} |", m.mean_abs_logit_shift);
+    let _ = writeln!(
+        s,
+        "| fabricated_identifiers | {} |",
+        m.fabricated_identifiers
+    );
+    let _ = writeln!(
+        s,
+        "| mean_abs_logit_shift | {:.3} |",
+        m.mean_abs_logit_shift
+    );
     let _ = writeln!(s, "| gaps_recorded | {} |", m.gaps_recorded);
     let (judged, acted) = stance_stats(&led.cycles);
     let _ = writeln!(s, "| свидетельств оценено позиционно | {judged} |");
     let _ = writeln!(s, "| из них p сдвинута | {acted} |");
     let _ = writeln!(s, "\n## Бюджет\n");
-    let _ = writeln!(s, "- циклов за час: {} / {}", budget.recent.len(), budget.max_cycles_per_hour);
+    let _ = writeln!(
+        s,
+        "- циклов за час: {} / {}",
+        budget.recent.len(),
+        budget.max_cycles_per_hour
+    );
     let _ = writeln!(s, "- циклов за сутки: {}", budget.cycles_today);
-    let _ = writeln!(s, "- токенов за сутки: {} / {}", budget.tokens_today, budget.max_tokens_per_day);
+    let _ = writeln!(
+        s,
+        "- токенов за сутки: {} / {}",
+        budget.tokens_today, budget.max_tokens_per_day
+    );
 
     let _ = writeln!(s, "\n## Леджер\n");
-    let _ = writeln!(s, "| id | p | probes | status | форма | вопрос |\n|---|---|---|---|---|---|");
+    let _ = writeln!(
+        s,
+        "| id | p | probes | status | форма | вопрос |\n|---|---|---|---|---|---|"
+    );
     let mut qs = led.questions.clone();
     qs.sort_by(|a, b| a.status_key().cmp(&b.status_key()).then(a.id.cmp(&b.id)));
     for q in qs {
@@ -2413,8 +2560,14 @@ fn print_idle_report(sdir: &PathBuf) {
         "  resolved {} · unresolved {} · fabricated {}",
         m.resolved, m.unresolved, m.fabricated
     );
-    println!("identifier_resolution_rate: {:.2} (по циклам с ID, не по всем)", m.identifier_resolution_rate);
-    println!("evidence_yield:             {:.2} (доля циклов, давших хоть один ID)", m.evidence_yield);
+    println!(
+        "identifier_resolution_rate: {:.2} (по циклам с ID, не по всем)",
+        m.identifier_resolution_rate
+    );
+    println!(
+        "evidence_yield:             {:.2} (доля циклов, давших хоть один ID)",
+        m.evidence_yield
+    );
     println!("fabricated_identifiers:     {}", m.fabricated_identifiers);
     println!("refutation_share:           {:.2}", m.refutation_share);
     println!("mean_abs_logit_shift:       {:.3}", m.mean_abs_logit_shift);
@@ -2451,7 +2604,13 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
             qs.sort_by(|a, b| a.status_key().cmp(&b.status_key()).then(a.id.cmp(&b.id)));
             for q in qs {
                 let form = q.form().as_str();
-                let flag = if q.form().allows_lr() { "" } else { "⚠️ " };
+                let flag = if q.superseded_by.is_some() {
+                    "→ заменён "
+                } else if q.form().allows_lr() {
+                    ""
+                } else {
+                    "⚠️ "
+                };
                 println!(
                     "{:<12} {:>6.2} {:>3}  {:<9} {:<3} {:<12} {flag}{}",
                     q.id,
@@ -2466,7 +2625,11 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
             let non_prop = led
                 .questions
                 .iter()
-                .filter(|q| !q.form().allows_lr() && q.status == ledger::QStatus::Open)
+                .filter(|q| {
+                    !q.form().allows_lr()
+                        && q.status == ledger::QStatus::Open
+                        && q.superseded_by.is_none()
+                })
                 .count();
             if non_prop > 0 {
                 println!();
@@ -2546,28 +2709,36 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
         "close" => {
             let id = args.get(3).cloned().unwrap_or_default();
             let how = args.get(4).map(String::as_str).unwrap_or("gap");
-            let (outcome, note) = match how {
-                "refuted" => (Outcome::Contradict, "закрыт человеком: опровергнут".to_string()),
-                "supported" => (Outcome::Support, "закрыт человеком: подтверждён".to_string()),
-                _ => (Outcome::None, "закрыт человеком: пробел (ответа нет)".to_string()),
-            };
-            let ids: Vec<String> = args
-                .iter()
-                .filter(|a| a.starts_with("PMID:") || a.starts_with("doi:") || a.starts_with("arXiv:"))
-                .cloned()
-                .collect();
-            match led.apply(&id, outcome, "human", ids, &note, 0) {
+            // --note "почему закрыт / какой ответ": без него причина закрытия терялась
+            let note = arg_str(args, "--note").unwrap_or_else(|| match how {
+                "refuted" => "опровергнут человеком".to_string(),
+                "supported" => "подтверждён человеком".to_string(),
+                _ => "пробел: ответа нет".to_string(),
+            });
+            match led.close_by_human(&id, how, &note) {
                 Some(c) => {
-                    if how != "refuted" && how != "supported" {
-                        if let Some(q) = led.questions.iter_mut().find(|q| q.id == id) {
-                            q.status = ledger::QStatus::Gap;
-                        }
-                    }
                     let _ = led.save(sdir);
                     let _ = led.append_cycle(sdir, &c);
                     println!("✅ {id} закрыт как «{how}»");
+                    println!("   причина: {note}");
                 }
                 None => println!("нет такого вопроса: {id}"),
+            }
+        }
+        "supersede" => {
+            let old_id = args.get(3).cloned().unwrap_or_default();
+            let new_id = args.get(4).cloned().unwrap_or_default();
+            if new_id.is_empty() {
+                println!("использование: ledger supersede <старый id> <новый id>");
+                return;
+            }
+            match led.supersede(&old_id, &new_id) {
+                Some(c) => {
+                    let _ = led.save(sdir);
+                    let _ = led.append_cycle(sdir, &c);
+                    println!("✅ {old_id} заменён на {new_id} (закрыт навсегда)");
+                }
+                None => println!("нет такого вопроса: {old_id}"),
             }
         }
         "set-kind" => {
@@ -2605,7 +2776,7 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
             println!("переоткрыто: {n}");
         }
         "report" => print_idle_report(sdir),
-        _ => println!("ledger list | add \"...\" [--p 0.5] [--kind lit|lab] | show <id> | seed | set-kind <id> lit|lab | reopen [id|all] | close <id> gap|refuted|supported | report"),
+        _ => println!("ledger list | add \"...\" [--p 0.5] [--kind lit|lab] | show <id> | seed | set-kind <id> lit|lab | reopen [id|all] | close <id> gap|refuted|supported [--note \"...\"] | supersede <old> <new> | report"),
     }
 }
 
