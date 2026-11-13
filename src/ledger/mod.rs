@@ -70,6 +70,8 @@ pub enum Outcome {
     Contradict,
     /// ничего: «искал, не нашёл»
     None,
+    /// лабораторный вопрос ждёт эксперимента: данных пока нет (не пробел и не трата бюджета)
+    WaitingLab,
     /// выдуманный идентификатор
     Fabricated,
     /// консилиум бесплатных чатов сказал «да»/«нет» — слабый сдвиг приора (не доказательство)
@@ -650,7 +652,13 @@ impl Ledger {
         let q = self.questions.iter_mut().find(|q| q.id == id)?;
         let before = q.p_true;
         let form = q.form();
-        q.probes += 1;
+        // Лабораторный опрос без данных — это «ждём эксперимент», а не проба поиска:
+        // иначе часовой `argus-lab` выжигает бюджет 12 проб за 12 часов и уводит вопрос
+        // в Gap, хотя он просто ждёт измерения (наблюдение 13.11 на q-8c6d5868).
+        let waiting_for_data = matches!(outcome, Outcome::WaitingLab);
+        if !waiting_for_data {
+            q.probes += 1;
+        }
         q.last_probed = Some(now.clone());
         // бюджет проб исчерпан, а вопрос не закрыт → он не должен висеть «open» невидимым
         if q.probes == MAX_PROBES_PER_QUESTION {
@@ -670,12 +678,23 @@ impl Ledger {
                 q.last_error = 1.0;
                 (VerifyResult::Fabricated, before)
             }
+            Outcome::WaitingLab => {
+                // ждём эксперимент: бюджет проб и счётчик пробелов не трогаем
+                q.gaps.push(note.to_string());
+                q.last_error = 0.1;
+                (VerifyResult::Unresolved, before)
+            }
             Outcome::None => {
                 q.gaps.push(note.to_string());
-                q.consecutive_gaps += 1;
-                q.last_error = 0.1;
-                if q.consecutive_gaps >= MAX_CONSECUTIVE_GAPS {
-                    q.status = QStatus::Gap;
+                if waiting_for_data {
+                    // ждём эксперимент: статус и счётчик пробелов не трогаем
+                    q.last_error = 0.1;
+                } else {
+                    q.consecutive_gaps += 1;
+                    q.last_error = 0.1;
+                    if q.consecutive_gaps >= MAX_CONSECUTIVE_GAPS {
+                        q.status = QStatus::Gap;
+                    }
                 }
                 (VerifyResult::Unresolved, before)
             }
@@ -1510,6 +1529,41 @@ mod tests {
         assert_eq!(m.council_cycles, 1);
         assert_eq!(m.gap_cycles, 0, "консилиум не должен считаться пробелом");
         assert_eq!(m.id_cycles, 0);
+    }
+
+    #[test]
+    fn lab_waiting_for_data_does_not_burn_probe_budget() {
+        let mut l = Ledger::default();
+        let id = l.add_kind(
+            "Держит ли fiducial-autofocus дрейф < 1 px за 72 ч?",
+            None,
+            QKind::Lab,
+        );
+        // часовой опрос: 20 раз «данных нет»
+        for _ in 0..20 {
+            l.apply(
+                &id,
+                Outcome::WaitingLab,
+                "probe:lab",
+                vec![],
+                "lab: данных нет — нужен эксперимент",
+                0,
+            );
+        }
+        let q = l.get(&id).unwrap();
+        assert_eq!(q.probes, 0, "ожидание данных не должно тратить бюджет проб");
+        assert_eq!(q.status, QStatus::Open, "вопрос ждёт эксперимент, а не в Gap");
+        assert!(l.select_next(1, 3).is_some(), "вопрос должен остаться в очереди");
+        assert!(!q.gaps.is_empty(), "факт ожидания всё равно пишется в журнал");
+    }
+
+    #[test]
+    fn lab_failed_probe_still_counts() {
+        let mut l = Ledger::default();
+        let id = l.add_kind("Держит ли стенд дрейф < 1 px?", None, QKind::Lab);
+        // ошибка канала (не «нет данных») обязана считаться пробой
+        l.apply(&id, Outcome::None, "probe:lab", vec![], "lab: артефакт устарел", 0);
+        assert_eq!(l.get(&id).unwrap().probes, 1);
     }
 
     #[test]

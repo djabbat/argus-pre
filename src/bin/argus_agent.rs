@@ -2329,7 +2329,7 @@ fn run_cycle(
         // ── лабораторный канал (M4): ответ даёт эксперимент, а не литература ──
         "lab" => match lab::load(sdir, &pick.id) {
             None => (
-                Outcome::None,
+                Outcome::WaitingLab,
                 vec![],
                 format!(
                     "lab: данных нет — нужен эксперимент; положить файл {}",
