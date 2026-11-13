@@ -498,8 +498,7 @@ impl Ledger {
     pub fn save(&self, state_dir: &Path) -> std::io::Result<()> {
         let d = Ledger::dir(state_dir);
         fs::create_dir_all(&d)?;
-        let s = serde_json::to_string_pretty(&self.questions)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let s = serde_json::to_string_pretty(&self.questions).map_err(std::io::Error::other)?;
         fs::write(d.join("questions.json"), s)
     }
 
@@ -510,8 +509,7 @@ impl Ledger {
             .create(true)
             .append(true)
             .open(d.join("cycles.jsonl"))?;
-        let line = serde_json::to_string(c)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let line = serde_json::to_string(c).map_err(std::io::Error::other)?;
         writeln!(f, "{line}")
     }
 
@@ -638,6 +636,7 @@ impl Ledger {
     /// (`QForm::Proposition`). Для количественного вопроса или поисковой темы
     /// исход `Support`/`Contradict` деградирует до `Evidence`: идентификаторы пишутся,
     /// `p` не меняется. Причина — у темы нет истинностного значения, у оценки нет «да/нет».
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_judged(
         &mut self,
         id: &str,
@@ -753,11 +752,11 @@ impl Ledger {
                     };
                     let p = shift(before, lr);
                     // консилиум НЕ закрывает вопрос: держим p ниже порога закрытия
-                    let capped = p.min(P_CLOSE_SUPPORT - 0.005).max(P_MIN);
+                    let capped = p.clamp(P_MIN, P_CLOSE_SUPPORT - 0.005);
                     q.p_prev = before;
                     q.p_true = capped;
-                    q.last_error = (((logit(capped) - logit(before)).abs() / 3.0) as f32)
-                        .clamp(0.0, 1.0);
+                    q.last_error =
+                        (((logit(capped) - logit(before)).abs() / 3.0) as f32).clamp(0.0, 1.0);
                     q.council_shifts += 1;
                     q.last_council_at = Some(now.clone());
                     (VerifyResult::Council, capped)
@@ -855,7 +854,8 @@ impl Ledger {
             }
             "refuted" => {
                 q.status = QStatus::Refuted;
-                q.refutations.push(format!("закрыт человеком (refuted): {note}"));
+                q.refutations
+                    .push(format!("закрыт человеком (refuted): {note}"));
             }
             _ => {
                 q.status = QStatus::Gap;
@@ -1429,15 +1429,30 @@ mod tests {
     #[test]
     fn superseded_question_never_returns_to_queue() {
         let mut l = Ledger::default();
-        let old = l.add("fiducial autofocus drift long-term time-lapse open microscope", None);
-        let new = l.add("Показано ли, что fiducial-автофокус удерживает дрейф < 1 px за 24 ч?", None);
+        let old = l.add(
+            "fiducial autofocus drift long-term time-lapse open microscope",
+            None,
+        );
+        let new = l.add(
+            "Показано ли, что fiducial-автофокус удерживает дрейф < 1 px за 24 ч?",
+            None,
+        );
         l.supersede(&old, &new).unwrap();
         assert_eq!(l.get(&old).unwrap().status, QStatus::Gap);
-        assert_eq!(l.get(&old).unwrap().superseded_by.as_deref(), Some(new.as_str()));
+        assert_eq!(
+            l.get(&old).unwrap().superseded_by.as_deref(),
+            Some(new.as_str())
+        );
         // даже через 100 часов заменённый вопрос не воскресает
-        assert_eq!(l.reopen_stale_gaps(Utc::now() + chrono::Duration::hours(100), 6), 0);
+        assert_eq!(
+            l.reopen_stale_gaps(Utc::now() + chrono::Duration::hours(100), 6),
+            0
+        );
         let picks: Vec<String> = (0..10).map(|s| l.select_next(s, 5).unwrap().id).collect();
-        assert!(picks.iter().all(|p| *p == new), "выбран заменённый: {picks:?}");
+        assert!(
+            picks.iter().all(|p| *p == new),
+            "выбран заменённый: {picks:?}"
+        );
     }
 
     #[test]
@@ -1449,7 +1464,10 @@ mod tests {
             .unwrap();
         let q = l.get(&id).unwrap();
         assert_eq!(q.status, QStatus::Supported);
-        assert_eq!(q.p_true, 0.5, "закрытие человеком не выдумывает уверенность");
+        assert_eq!(
+            q.p_true, 0.5,
+            "закрытие человеком не выдумывает уверенность"
+        );
         assert_eq!(c.probe, "human:close");
         assert!(q.gaps.iter().any(|g| g.contains("n ≈ 115")), "{:?}", q.gaps);
         // Gap-закрытие убирает вопрос из очереди
@@ -1466,11 +1484,26 @@ mod tests {
         let mut l = Ledger::default();
         let id = l.add("Держит ли стенд дрейф < 1 px за 72 ч?", None);
         let c = l
-            .apply(&id, Outcome::CouncilSupport, "probe:dialogue", vec![], "3/3 да", 0)
+            .apply(
+                &id,
+                Outcome::CouncilSupport,
+                "probe:dialogue",
+                vec![],
+                "3/3 да",
+                0,
+            )
             .unwrap();
         let q = l.get(&id).unwrap();
-        assert!(q.p_true > 0.5, "консилиум должен слабо поднять p: {}", q.p_true);
-        assert!(q.p_true < 0.70, "консилиум не должен быть убедительным: {}", q.p_true);
+        assert!(
+            q.p_true > 0.5,
+            "консилиум должен слабо поднять p: {}",
+            q.p_true
+        );
+        assert!(
+            q.p_true < 0.70,
+            "консилиум не должен быть убедительным: {}",
+            q.p_true
+        );
         assert_eq!(q.status, QStatus::Open, "консилиум не закрывает вопрос");
         assert_eq!(c.verifier, VerifyResult::Council);
         // даже многократно (разные сутки) не пробивает порог закрытия
@@ -1479,10 +1512,21 @@ mod tests {
             if let Some(q) = l.questions.iter_mut().find(|q| q.id == id) {
                 q.last_council_at = None;
             }
-            l.apply(&id, Outcome::CouncilSupport, "probe:dialogue", vec![], "", 0);
+            l.apply(
+                &id,
+                Outcome::CouncilSupport,
+                "probe:dialogue",
+                vec![],
+                "",
+                0,
+            );
         }
         let q = l.get(&id).unwrap();
-        assert!(q.p_true < P_CLOSE_SUPPORT, "потолок консилиума: p={}", q.p_true);
+        assert!(
+            q.p_true < P_CLOSE_SUPPORT,
+            "потолок консилиума: p={}",
+            q.p_true
+        );
         assert!(
             !matches!(q.status, QStatus::Supported | QStatus::Refuted),
             "консилиум не имеет права закрыть вопрос: {:?}",
@@ -1494,10 +1538,24 @@ mod tests {
     fn council_cannot_shift_twice_within_a_day() {
         let mut l = Ledger::default();
         let id = l.add("Держит ли стенд дрейф < 1 px за 72 ч?", None);
-        l.apply(&id, Outcome::CouncilSupport, "probe:dialogue", vec![], "да", 0);
+        l.apply(
+            &id,
+            Outcome::CouncilSupport,
+            "probe:dialogue",
+            vec![],
+            "да",
+            0,
+        );
         let after_first = l.get(&id).unwrap().p_true;
         let c = l
-            .apply(&id, Outcome::CouncilSupport, "probe:dialogue", vec![], "да снова", 0)
+            .apply(
+                &id,
+                Outcome::CouncilSupport,
+                "probe:dialogue",
+                vec![],
+                "да снова",
+                0,
+            )
             .unwrap();
         assert_eq!(c.before, c.after, "второй сдвиг за сутки запрещён");
         assert_eq!(l.get(&id).unwrap().p_true, after_first);
@@ -1514,7 +1572,14 @@ mod tests {
         let mut l = Ledger::default();
         let id = l.add("fiducial autofocus drift long-term imaging", None);
         let c = l
-            .apply(&id, Outcome::CouncilSupport, "probe:dialogue", vec![], "да", 0)
+            .apply(
+                &id,
+                Outcome::CouncilSupport,
+                "probe:dialogue",
+                vec![],
+                "да",
+                0,
+            )
             .unwrap();
         assert_eq!(c.before, c.after);
         assert_eq!(l.get(&id).unwrap().p_true, 0.5);
@@ -1524,7 +1589,14 @@ mod tests {
     fn council_cycles_are_counted_separately_in_metrics() {
         let mut l = Ledger::default();
         let id = l.add("Держит ли стенд дрейф < 1 px?", None);
-        l.apply(&id, Outcome::CouncilContradict, "probe:dialogue", vec![], "нет", 0);
+        l.apply(
+            &id,
+            Outcome::CouncilContradict,
+            "probe:dialogue",
+            vec![],
+            "нет",
+            0,
+        );
         let m = l.metrics();
         assert_eq!(m.council_cycles, 1);
         assert_eq!(m.gap_cycles, 0, "консилиум не должен считаться пробелом");
@@ -1552,9 +1624,19 @@ mod tests {
         }
         let q = l.get(&id).unwrap();
         assert_eq!(q.probes, 0, "ожидание данных не должно тратить бюджет проб");
-        assert_eq!(q.status, QStatus::Open, "вопрос ждёт эксперимент, а не в Gap");
-        assert!(l.select_next(1, 3).is_some(), "вопрос должен остаться в очереди");
-        assert!(!q.gaps.is_empty(), "факт ожидания всё равно пишется в журнал");
+        assert_eq!(
+            q.status,
+            QStatus::Open,
+            "вопрос ждёт эксперимент, а не в Gap"
+        );
+        assert!(
+            l.select_next(1, 3).is_some(),
+            "вопрос должен остаться в очереди"
+        );
+        assert!(
+            !q.gaps.is_empty(),
+            "факт ожидания всё равно пишется в журнал"
+        );
     }
 
     #[test]
@@ -1562,7 +1644,14 @@ mod tests {
         let mut l = Ledger::default();
         let id = l.add_kind("Держит ли стенд дрейф < 1 px?", None, QKind::Lab);
         // ошибка канала (не «нет данных») обязана считаться пробой
-        l.apply(&id, Outcome::None, "probe:lab", vec![], "lab: артефакт устарел", 0);
+        l.apply(
+            &id,
+            Outcome::None,
+            "probe:lab",
+            vec![],
+            "lab: артефакт устарел",
+            0,
+        );
         assert_eq!(l.get(&id).unwrap().probes, 1);
     }
 

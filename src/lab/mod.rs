@@ -51,7 +51,9 @@ impl LabVerdict {
         match s.trim().to_lowercase().as_str() {
             "support" | "да" | "yes" | "pass" => Some(LabVerdict::Support),
             "contradict" | "нет" | "no" | "fail" => Some(LabVerdict::Contradict),
-            "inconclusive" | "неопределённо" | "unknown" => Some(LabVerdict::Inconclusive),
+            "inconclusive" | "неопределённо" | "unknown" => {
+                Some(LabVerdict::Inconclusive)
+            }
             _ => None,
         }
     }
@@ -108,8 +110,7 @@ pub fn record(state_dir: &Path, ev: &LabEvidence) -> std::io::Result<PathBuf> {
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d)?;
     }
-    let s = serde_json::to_string_pretty(ev)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let s = serde_json::to_string_pretty(ev).map_err(std::io::Error::other)?;
     std::fs::write(&p, s)?;
     Ok(p)
 }
@@ -120,7 +121,11 @@ pub fn record(state_dir: &Path, ev: &LabEvidence) -> std::io::Result<PathBuf> {
 /// Зачем: консилиум из малых моделей путается в сравнении чисел (13 ноя: qwen сказала
 /// «0.58 > 1 px» → `contradict`). Детерминированная проверка ловит такие расхождения
 /// раньше, чем они попадут в вероятность: цифра обязана соответствовать вердикту.
-pub fn numeric_consistency(question: &str, value: &str, verdict: &LabVerdict) -> Result<(), String> {
+pub fn numeric_consistency(
+    question: &str,
+    value: &str,
+    verdict: &LabVerdict,
+) -> Result<(), String> {
     let qnum = first_number(question);
     let vnum = first_number(value);
     let (Some(threshold), Some(measured)) = (qnum, vnum) else {
@@ -131,7 +136,8 @@ pub fn numeric_consistency(question: &str, value: &str, verdict: &LabVerdict) ->
     }
     // направление порога: «< 1», «ниже 1», «≤ 1» — меньше значит «да»
     let low = question.to_lowercase();
-    let less = low.contains('<') || low.contains('≤') || low.contains("ниже") || low.contains("меньше");
+    let less =
+        low.contains('<') || low.contains('≤') || low.contains("ниже") || low.contains("меньше");
     let satisfied = if less {
         measured <= threshold
     } else {
@@ -172,7 +178,9 @@ pub fn validate(
     question: &str,
 ) -> Result<(), String> {
     if ev.verdict == LabVerdict::Inconclusive {
-        return Err("вердикт inconclusive: данные есть, ответа нет — вероятность не двигается".into());
+        return Err(
+            "вердикт inconclusive: данные есть, ответа нет — вероятность не двигается".into(),
+        );
     }
     if ev.source.trim().is_empty() {
         return Err("не указан артефакт (source) — цифра без источника не принимается".into());
@@ -238,7 +246,11 @@ mod tests {
     #[test]
     fn missing_artifact_is_rejected() {
         let dir = tmp();
-        let e = ev(LabVerdict::Support, "lab/нет-такого.csv", Some("2027-01-10"));
+        let e = ev(
+            LabVerdict::Support,
+            "lab/нет-такого.csv",
+            Some("2027-01-10"),
+        );
         let err = validate(&dir, &e, Utc::now(), DEFAULT_MAX_AGE_DAYS, "").unwrap_err();
         assert!(err.contains("артефакт не найден"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -306,7 +318,10 @@ mod tests {
     fn verdict_parsing_from_cli_values() {
         assert_eq!(LabVerdict::parse("да"), Some(LabVerdict::Support));
         assert_eq!(LabVerdict::parse("FAIL"), Some(LabVerdict::Contradict));
-        assert_eq!(LabVerdict::parse("неопределённо"), Some(LabVerdict::Inconclusive));
+        assert_eq!(
+            LabVerdict::parse("неопределённо"),
+            Some(LabVerdict::Inconclusive)
+        );
         assert_eq!(LabVerdict::parse("?!"), None);
     }
 }

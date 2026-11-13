@@ -8,7 +8,6 @@
 //! Ключевое: поиск НЕ выносит суждение о вопросе. Он возвращает кандидатов с идентификаторами,
 //! которые затем обязан резолвить `verify`. Проба без суждения = `Outcome::Evidence`.
 
-use crate::cka::Vectorizer;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -623,9 +622,15 @@ mod tests {
 
     #[test]
     fn glossary_does_not_override_english_question() {
-        let q = build_query_for("epmc", "centriole pair distance electron microscopy human fibroblasts");
+        let q = build_query_for(
+            "epmc",
+            "centriole pair distance electron microscopy human fibroblasts",
+        );
         assert!(q.contains("centriole"));
-        assert!(!q.contains("daughter"), "глоссарий не должен примешиваться: «{q}»");
+        assert!(
+            !q.contains("daughter"),
+            "глоссарий не должен примешиваться: «{q}»"
+        );
     }
 
     #[test]

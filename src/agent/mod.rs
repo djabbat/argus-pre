@@ -2572,7 +2572,7 @@ mod tests {
             crate::effects::Attention::Blocker,
         );
         q.save(&dir);
-        let mut loop_ = AgentLoop {
+        let loop_ = AgentLoop {
             model: &StubModel,
             mode: Mode::Default,
             cfg: LoopConfig::default(),
@@ -2586,8 +2586,8 @@ mod tests {
             state_dir: Some(dir.clone()),
             mandate: None,
         };
-        let mut mem = crate::memory::Memory::load(&dir);
-        let prompt = loop_.build_prompt("тест", &mut mem, &[]);
+        let mem = crate::memory::Memory::load(&dir);
+        let prompt = loop_.build_prompt("тест", &mem, &[]);
         assert!(
             prompt.contains("### attention"),
             "внимание должно быть в промпте"
@@ -2616,8 +2616,10 @@ mod tests {
     /// P8e: watchdog останавливает цикл по лимиту шагов (max_steps реально работает).
     #[test]
     fn watchdog_stops_at_max_steps() {
-        let mut cfg = LoopConfig::default();
-        cfg.max_steps = 5; // малый лимит для теста
+        let cfg = LoopConfig {
+            max_steps: 5, // малый лимит для теста
+            ..Default::default()
+        };
         let mut wd = Watchdog::new(&cfg);
         // шаги 0..5 — ок (step > max_steps → стоп)
         for s in 0..=5 {
@@ -2646,8 +2648,10 @@ mod tests {
     /// P8e: watchdog.report содержит метаданные прогона.
     #[test]
     fn watchdog_report_has_meta() {
-        let mut cfg = LoopConfig::default();
-        cfg.max_steps = 7;
+        let cfg = LoopConfig {
+            max_steps: 7,
+            ..Default::default()
+        };
         let mut wd = Watchdog::new(&cfg);
         wd.steps = 4;
         let rep = wd.report("тест", "готово");

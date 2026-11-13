@@ -88,8 +88,7 @@ pub fn record(state_dir: &Path, ev: &ExternalEvidence) -> std::io::Result<PathBu
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d)?;
     }
-    let s = serde_json::to_string_pretty(ev)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let s = serde_json::to_string_pretty(ev).map_err(std::io::Error::other)?;
     std::fs::write(&p, s)?;
     Ok(p)
 }
@@ -110,7 +109,9 @@ fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -129,15 +130,28 @@ pub fn search_zenodo(query: &str, limit: usize) -> Result<Vec<Candidate>, String
     if status != 200 {
         return Err(format!("zenodo: HTTP {status}"));
     }
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("zenodo json: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("zenodo json: {e}"))?;
     let mut out = Vec::new();
-    let Some(hits) = v.get("hits").and_then(|h| h.get("hits")).and_then(|h| h.as_array()) else {
+    let Some(hits) = v
+        .get("hits")
+        .and_then(|h| h.get("hits"))
+        .and_then(|h| h.as_array())
+    else {
         return Ok(out);
     };
     for r in hits {
         let meta = r.get("metadata").unwrap_or(&serde_json::Value::Null);
-        let title = meta.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
-        let doi = meta.get("doi").and_then(|d| d.as_str()).unwrap_or("").to_string();
+        let title = meta
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let doi = meta
+            .get("doi")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_string();
         let desc = meta
             .get("description")
             .and_then(|d| d.as_str())
@@ -184,7 +198,8 @@ pub fn search_github(query: &str, limit: usize) -> Result<Vec<Candidate>, String
     if status != 200 {
         return Err(format!("github: HTTP {status}"));
     }
-    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("github json: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("github json: {e}"))?;
     let mut out = Vec::new();
     let Some(items) = v.get("items").and_then(|i| i.as_array()) else {
         return Ok(out);

@@ -156,11 +156,21 @@ fn main() {
             return;
         }
         let t = permutation_test(&x, &y, perms, seed);
-        println!("КОНТРОЛЬ «разные корпуса»: {} абзацев, B берёт текст из {}", t.n, c2);
-        println!("CKA = {:.3} · нуль: среднее {:.3}, 95% {:.3} · p = {:.3}", t.observed, t.null_mean, t.null_p95, t.p_value);
+        println!(
+            "КОНТРОЛЬ «разные корпуса»: {} абзацев, B берёт текст из {}",
+            t.n, c2
+        );
+        println!(
+            "CKA = {:.3} · нуль: среднее {:.3}, 95% {:.3} · p = {:.3}",
+            t.observed, t.null_mean, t.null_p95, t.p_value
+        );
         println!(
             "ожидание: сходимость на уровне нуля (p > 0.05). Факт: {}",
-            if t.p_value > 0.05 { "✅ на уровне нуля" } else { "❌ выше нуля — метрика ловит не содержание, а форму" }
+            if t.p_value > 0.05 {
+                "✅ на уровне нуля"
+            } else {
+                "❌ выше нуля — метрика ловит не содержание, а форму"
+            }
         );
         return;
     }
@@ -215,14 +225,28 @@ fn main() {
             t.n, t.perms, t.observed, t.null_mean, t.null_p95, t.p_value, self_cka, nn_a, nn_b, va.name(), vb.name()
         );
     } else {
-        println!("корпус: {} абзацев из {} файлов (в тесте {})", items.len(), files.len(), x.len());
-        println!("A: {} (dim {}) · B: {} (dim {})", va.name(), x[0].len(), vb.name(), y[0].len());
+        println!(
+            "корпус: {} абзацев из {} файлов (в тесте {})",
+            items.len(),
+            files.len(),
+            x.len()
+        );
+        println!(
+            "A: {} (dim {}) · B: {} (dim {})",
+            va.name(),
+            x[0].len(),
+            vb.name(),
+            y[0].len()
+        );
         println!(
             "CKA = {:.3} · нуль: среднее {:.3}, 95% {:.3} · p = {:.3} ({} перестановок)",
             t.observed, t.null_mean, t.null_p95, t.p_value, t.perms
         );
         println!("контроль: CKA(X,X) = {:.3} (должно быть 1.000)", self_cka);
-        println!("ближайший сосед: A {:.3} · B {:.3} (вырожденность: чем ближе к 1, тем хуже)", nn_a, nn_b);
+        println!(
+            "ближайший сосед: A {:.3} · B {:.3} (вырожденность: чем ближе к 1, тем хуже)",
+            nn_a, nn_b
+        );
         println!("вердикт: {verdict}");
     }
 

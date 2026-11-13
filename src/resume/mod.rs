@@ -10,7 +10,7 @@
 //! Здесь — только арифметика догоняния и персист «последнего тика»; блокировку сна делает
 //! systemd-юнит (`systemd-inhibit --what=idle:sleep`).
 
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,8 +51,7 @@ impl Runtime {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let s = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let s = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         fs::write(&self.path, s)
     }
 
@@ -131,6 +130,7 @@ pub fn resume_note(plan: (u32, u64, u64)) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
 
     fn ago(secs: i64) -> String {
         (Utc::now() - Duration::seconds(secs)).to_rfc3339()

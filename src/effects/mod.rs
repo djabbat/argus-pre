@@ -890,7 +890,7 @@ mod tests {
 
     #[test]
     fn default_attention_is_action() {
-        let (mut q, d) = q("p8g-default");
+        let (mut q, _d) = q("p8g-default");
         let id = q.enqueue(EffectKind::Notify, "n", serde_json::json!({}));
         assert_eq!(q.effects[0].attention, Attention::Action);
         assert_ne!(id, 0);
@@ -901,7 +901,7 @@ mod tests {
         let (mut q, d) = q("p8g-quiet");
         q.register_handler(EffectKind::Notify, ok_handler());
         // доставить Action-сообщение
-        let id = q.enqueue_with_attention(
+        let _id = q.enqueue_with_attention(
             EffectKind::Notify,
             "status",
             serde_json::json!({"message": "первое"}),

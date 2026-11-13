@@ -51,9 +51,11 @@ pub struct JudgeConfig {
 
 impl JudgeConfig {
     pub fn from_env() -> Self {
-        let model = std::env::var("ARGUS_JUDGE_MODEL")
-            .unwrap_or_else(|_| "qwen2.5:7b-16k".to_string());
-        let api_key = std::env::var("ARGUS_JUDGE_KEY").ok().filter(|k| !k.trim().is_empty());
+        let model =
+            std::env::var("ARGUS_JUDGE_MODEL").unwrap_or_else(|_| "qwen2.5:7b-16k".to_string());
+        let api_key = std::env::var("ARGUS_JUDGE_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty());
         let ai = if api_key.is_some() {
             Api::OpenAi
         } else {
@@ -77,7 +79,9 @@ impl JudgeConfig {
 
     pub fn enabled() -> bool {
         match std::env::var("ARGUS_JUDGE") {
-            Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")),
+            Ok(v) => {
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            }
             Err(_) => true,
         }
     }
@@ -122,8 +126,7 @@ impl JudgeCache {
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d)?;
         }
-        let s = serde_json::to_string_pretty(&self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let s = serde_json::to_string_pretty(&self).map_err(std::io::Error::other)?;
         std::fs::write(p, s)
     }
 
@@ -165,7 +168,11 @@ pub struct Item<'a> {
 }
 
 pub fn build_user_prompt(question: &str, item: &Item<'_>) -> String {
-    let abs: String = item.abstract_text.chars().take(MAX_ABSTRACT_CHARS).collect();
+    let abs: String = item
+        .abstract_text
+        .chars()
+        .take(MAX_ABSTRACT_CHARS)
+        .collect();
     format!(
         "УТВЕРЖДЕНИЕ: {question}\n\nЗАГОЛОВОК: {}\nТЕКСТ: {}\n",
         item.title,
@@ -203,8 +210,18 @@ pub fn verdict_gate(question: &str, evidence_text: &str, quote: &str) -> Result<
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| w.chars().count() >= 4)
         .filter(|w| {
-            !["does", "with", "from", "this", "that", "over", "than", "published", "shown"]
-                .contains(w)
+            ![
+                "does",
+                "with",
+                "from",
+                "this",
+                "that",
+                "over",
+                "than",
+                "published",
+                "shown",
+            ]
+            .contains(w)
         })
         .map(|w| w.to_string())
         .collect();
@@ -217,7 +234,10 @@ pub fn verdict_gate(question: &str, evidence_text: &str, quote: &str) -> Result<
     // числовой якорь: если в вопросе есть числа, хотя бы одно должно быть в цитате
     let nums = numbers(question);
     if !nums.is_empty() && !nums.iter().any(|n| has_number(&qn, n)) {
-        return Err(format!("в цитате нет чисел утверждения ({})", nums.join("/")));
+        return Err(format!(
+            "в цитате нет чисел утверждения ({})",
+            nums.join("/")
+        ));
     }
     Ok(())
 }
@@ -243,7 +263,7 @@ fn numbers(s: &str) -> Vec<String> {
     if !cur.is_empty() {
         out.push(cur);
     }
-    out.retain(|n| n.trim_matches('.').len() >= 1 && n != ".");
+    out.retain(|n| !n.trim_matches('.').is_empty() && n != ".");
     out.dedup();
     out
 }
@@ -314,9 +334,7 @@ pub fn parse_verdict(text: &str) -> Option<Verdict> {
             .unwrap_or("")
             .trim()
             .to_string(),
-        why: sanitize(
-            v.get("why").and_then(|w| w.as_str()).unwrap_or(""),
-        ),
+        why: sanitize(v.get("why").and_then(|w| w.as_str()).unwrap_or("")),
     })
 }
 
@@ -376,7 +394,10 @@ pub fn judge_batch(
         let evidence = format!(
             "{} {}",
             it.title,
-            it.abstract_text.chars().take(MAX_ABSTRACT_CHARS).collect::<String>()
+            it.abstract_text
+                .chars()
+                .take(MAX_ABSTRACT_CHARS)
+                .collect::<String>()
         );
         let prompt = build_user_prompt(question, it);
         let (body, used) = match call_model(cfg, &prompt) {
@@ -446,13 +467,14 @@ pub fn judge_batch(
     }
 
     let note = if !errors.is_empty() {
-        format!("судья недоступен ({}), вердиктов нет — остаётся лексика", errors[0])
+        format!(
+            "судья недоступен ({}), вердиктов нет — остаётся лексика",
+            errors[0]
+        )
     } else if fresh == 0 {
         format!("судья: все {} вердиктов из кэша", items.len())
     } else {
-        format!(
-            "судья: {fresh} новых вердиктов, отклонено воротами {gated}, {tokens} токенов"
-        )
+        format!("судья: {fresh} новых вердиктов, отклонено воротами {gated}, {tokens} токенов")
     };
     JudgeOutcome {
         decisions,
@@ -513,7 +535,11 @@ fn call_model(cfg: &JudgeConfig, user: &str) -> Result<(String, u64), String> {
     let status = resp.status();
     let body = resp.text().map_err(|e| format!("тело: {e}"))?;
     if !status.is_success() {
-        return Err(format!("HTTP {}: {}", status.as_u16(), body.chars().take(160).collect::<String>()));
+        return Err(format!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            body.chars().take(160).collect::<String>()
+        ));
     }
     let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("JSON: {e}"))?;
     let content = match cfg.api {
@@ -533,7 +559,10 @@ fn call_model(cfg: &JudgeConfig, user: &str) -> Result<(String, u64), String> {
 
     let tokens = match cfg.api {
         Api::Ollama => {
-            let a = v.get("prompt_eval_count").and_then(|x| x.as_u64()).unwrap_or(0);
+            let a = v
+                .get("prompt_eval_count")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0);
             let b = v.get("eval_count").and_then(|x| x.as_u64()).unwrap_or(0);
             a + b
         }
@@ -636,7 +665,10 @@ mod tests {
     #[test]
     fn number_token_match_is_exact() {
         assert!(has_number("below 1 px", "1"));
-        assert!(!has_number("below 0.1 px", "1"), "«1» не должна совпадать внутри «0.1»");
+        assert!(
+            !has_number("below 0.1 px", "1"),
+            "«1» не должна совпадать внутри «0.1»"
+        );
         assert!(!has_number("over 12 h", "1"));
     }
 

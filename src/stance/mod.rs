@@ -253,13 +253,13 @@ fn numbers(text: &str) -> Vec<String> {
         if ch.is_ascii_digit() || (ch == '.' && !cur.is_empty()) {
             cur.push(ch);
         } else if !cur.is_empty() {
-            if cur.trim_matches('.').len() >= 1 {
+            if !cur.trim_matches('.').is_empty() {
                 out.push(cur.clone());
             }
             cur.clear();
         }
     }
-    if !cur.is_empty() && cur.trim_matches('.').len() >= 1 {
+    if !cur.is_empty() && !cur.trim_matches('.').is_empty() {
         out.push(cur);
     }
     out.retain(|n| n != "." && n != "..");
@@ -547,7 +547,10 @@ mod tests {
             source: "test",
             reason: "c".into(),
         };
-        assert_eq!(aggregate(&[sup.clone()]).stance, Stance::Support);
+        assert_eq!(
+            aggregate(std::slice::from_ref(&sup)).stance,
+            Stance::Support
+        );
         assert_eq!(aggregate(&[sup, con]).stance, Stance::Neutral);
     }
 
@@ -592,7 +595,7 @@ mod tests {
         };
         // LLM действует → он главный
         assert_eq!(
-            aggregate_with(&lexical_neutral, &[llm_con.clone()]).stance,
+            aggregate_with(&lexical_neutral, std::slice::from_ref(&llm_con)).stance,
             Stance::Contradict
         );
         // LLM молчит → остаётся лексика

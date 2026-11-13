@@ -151,8 +151,7 @@ impl Cache {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let s = serde_json::to_string_pretty(&self.entries)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let s = serde_json::to_string_pretty(&self.entries).map_err(std::io::Error::other)?;
         fs::write(&self.path, s)
     }
 

@@ -101,11 +101,17 @@ impl CouncilConfig {
                     "ARGUS_COUNCIL_KEY_{}",
                     model
                         .chars()
-                        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+                        .map(|c| if c.is_ascii_alphanumeric() {
+                            c.to_ascii_uppercase()
+                        } else {
+                            '_'
+                        })
                         .collect::<String>()
                 );
                 members.push(Member {
-                    api_key: std::env::var(&key_var).ok().or_else(|| std::env::var("ARGUS_COUNCIL_KEY").ok()),
+                    api_key: std::env::var(&key_var)
+                        .ok()
+                        .or_else(|| std::env::var("ARGUS_COUNCIL_KEY").ok()),
                     label: model.clone(),
                     model,
                     url,
@@ -114,7 +120,10 @@ impl CouncilConfig {
             }
         }
         // облачные бесплатные тиры (ключи берём из конфига pi, не из окружения)
-        if std::env::var("ARGUS_COUNCIL_CLOUD").map(|v| v != "0").unwrap_or(false) {
+        if std::env::var("ARGUS_COUNCIL_CLOUD")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
             // cerebras → 402 payment required, together/fireworks → 403/биллинг,
             // huggingface без ключа-router → не подключаем по умолчанию
             let list = std::env::var("ARGUS_COUNCIL_PROVIDERS")
@@ -159,9 +168,7 @@ impl CouncilConfig {
         let path = std::env::var("ARGUS_PROVIDERS_JSON")
             .ok()
             .map(std::path::PathBuf::from)
-            .or_else(|| {
-                dirs::home_dir().map(|h| h.join(".pi/agent/models.json"))
-            })?;
+            .or_else(|| dirs::home_dir().map(|h| h.join(".pi/agent/models.json")))?;
         let raw = std::fs::read_to_string(path).ok()?;
         let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
         let p = v.get("providers")?.get(provider)?;
@@ -170,7 +177,11 @@ impl CouncilConfig {
         if key.is_empty() || key.starts_with('$') {
             return None;
         }
-        let mut base = p.get("baseUrl")?.as_str()?.trim_end_matches('/').to_string();
+        let mut base = p
+            .get("baseUrl")?
+            .as_str()?
+            .trim_end_matches('/')
+            .to_string();
         // домен api-inference.huggingface.co больше не резолвится — рабочий роутер
         if provider == "huggingface" {
             base = "https://router.huggingface.co/v1".to_string();
@@ -220,8 +231,17 @@ impl CouncilConfig {
             })
             .unwrap_or_default();
         const BAD: [&str; 11] = [
-            "whisper", "guard", "tts", "embed", "rerank", "moderation", "image", "audio",
-            "vision-only", "code", "ocr",
+            "whisper",
+            "guard",
+            "tts",
+            "embed",
+            "rerank",
+            "moderation",
+            "image",
+            "audio",
+            "vision-only",
+            "code",
+            "ocr",
         ];
         let mut cands: Vec<String> = ids
             .into_iter()
@@ -253,7 +273,9 @@ impl CouncilConfig {
 
     pub fn enabled() -> bool {
         match std::env::var("ARGUS_COUNCIL") {
-            Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")),
+            Ok(v) => {
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            }
             Err(_) => true,
         }
     }
@@ -342,9 +364,7 @@ pub fn analyze(opinions: Vec<Opinion>, min_agree: usize) -> Consensus {
     if n_sup >= min_agree && n_con >= min_agree {
         return Consensus {
             agree: n_sup.max(n_con),
-            reason: format!(
-                "модели расходятся: за «да» {n_sup}, за «нет» {n_con} — воздержание"
-            ),
+            reason: format!("модели расходятся: за «да» {n_sup}, за «нет» {n_con} — воздержание"),
             ..base
         };
     }
@@ -490,17 +510,15 @@ fn ask_member(cfg: &CouncilConfig, m: &Member, prompt: &str) -> Result<Opinion, 
     }
     let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("JSON: {e}"))?;
     let content = match m.api {
-        Api::Ollama => v
-            .get("message")
-            .map(|x| {
-                let c = x.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                if c.trim().is_empty() {
-                    // reasoning-модели (deepseek-r1) кладут текст в `thinking`
-                    x.get("thinking").and_then(|c| c.as_str()).unwrap_or("")
-                } else {
-                    c
-                }
-            }),
+        Api::Ollama => v.get("message").map(|x| {
+            let c = x.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if c.trim().is_empty() {
+                // reasoning-модели (deepseek-r1) кладут текст в `thinking`
+                x.get("thinking").and_then(|c| c.as_str()).unwrap_or("")
+            } else {
+                c
+            }
+        }),
         Api::OpenAi => v
             .get("choices")
             .and_then(|c| c.get(0))
@@ -509,9 +527,7 @@ fn ask_member(cfg: &CouncilConfig, m: &Member, prompt: &str) -> Result<Opinion, 
                 let c = x.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 if c.trim().is_empty() {
                     // reasoning-модели (gpt-oss, ernie …) кладут текст в reasoning
-                    x.get("reasoning")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("")
+                    x.get("reasoning").and_then(|r| r.as_str()).unwrap_or("")
                 } else {
                     c
                 }
@@ -595,7 +611,10 @@ mod tests {
     #[test]
     fn single_model_is_not_a_consensus() {
         let c = analyze(
-            vec![op("a", Stance::Support, 0.95), op("b", Stance::Neutral, 0.0)],
+            vec![
+                op("a", Stance::Support, 0.95),
+                op("b", Stance::Neutral, 0.0),
+            ],
             MIN_AGREE,
         );
         assert_eq!(c.stance, Stance::Neutral);
@@ -627,7 +646,11 @@ mod tests {
             ],
             MIN_AGREE,
         );
-        assert_eq!(c.stance, Stance::Neutral, "низкая уверенность не считается голосом");
+        assert_eq!(
+            c.stance,
+            Stance::Neutral,
+            "низкая уверенность не считается голосом"
+        );
     }
 
     #[test]
@@ -646,7 +669,11 @@ mod tests {
         .unwrap();
         assert_eq!(o.stance, Stance::Support);
         assert!(o.key_point.contains("0.6 px"));
-        let o2 = parse_opinion("m", r#"{"stance":"neutral","confidence":0.1,"key_point":"文本"}"#).unwrap();
+        let o2 = parse_opinion(
+            "m",
+            r#"{"stance":"neutral","confidence":0.1,"key_point":"文本"}"#,
+        )
+        .unwrap();
         assert!(!o2.key_point.contains('文'));
     }
 
@@ -683,15 +710,24 @@ mod tests {
     #[test]
     fn free_model_table_has_no_paid_defaults() {
         assert!(CouncilConfig::free_model("groq").is_some());
-        assert_eq!(CouncilConfig::free_model("groq"), Some("openai/gpt-oss-20b"));
-        assert!(CouncilConfig::free_model("deepseek").is_none(), "платные не по умолчанию");
+        assert_eq!(
+            CouncilConfig::free_model("groq"),
+            Some("openai/gpt-oss-20b")
+        );
+        assert!(
+            CouncilConfig::free_model("deepseek").is_none(),
+            "платные не по умолчанию"
+        );
         assert!(CouncilConfig::free_model("deepinfra").is_none());
     }
 
     #[test]
     fn consensus_label_is_auditable() {
         let c = analyze(
-            vec![op("a", Stance::Contradict, 0.9), op("b", Stance::Contradict, 0.8)],
+            vec![
+                op("a", Stance::Contradict, 0.9),
+                op("b", Stance::Contradict, 0.8),
+            ],
             2,
         );
         assert_eq!(c.label(), "council:2/2:contradict");

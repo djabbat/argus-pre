@@ -1,15 +1,15 @@
 //! argus-agent V3.6 — CLI-вход: init / run / memory / skill / session / task / plugin / bench / eval / fusion / serve
 //! Паттерны: P1 (цикл + реальная LLM), P2 (файловая память), P4 (режимы-сессия).
 use argus_pre::agent::{AgentLoop, LlmConfig, LlmModel, LoopConfig, Mode, StubModel};
+use argus_pre::dialogue;
+use argus_pre::lab;
 use argus_pre::ledger::{self, Ledger, Outcome};
 use argus_pre::memory::{Memory, NoteKind};
 use argus_pre::probe::{self, CorpusSearcher, EpMcSearcher, Searcher};
-use argus_pre::dialogue;
-use argus_pre::lab;
 use argus_pre::stance;
 use argus_pre::thirdparty;
 use argus_pre::verify::{self, Cache, HttpFetcher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn state_dir() -> PathBuf {
     std::env::var("ARGUS_STATE_DIR")
@@ -1860,7 +1860,7 @@ struct LoopLock {
 }
 
 impl LoopLock {
-    fn acquire(sdir: &PathBuf) -> Result<LoopLock, String> {
+    fn acquire(sdir: &Path) -> Result<LoopLock, String> {
         let path = sdir.join("ledger").join("think.lock");
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1906,7 +1906,7 @@ struct ThinkCfg {
     interval_secs: u64,
 }
 
-fn parse_think_cfg(args: &[String], sdir: &PathBuf) -> ThinkCfg {
+fn parse_think_cfg(args: &[String], sdir: &Path) -> ThinkCfg {
     ThinkCfg {
         dry: args.iter().any(|a| a == "--dry-run")
             || !args.iter().any(|a| a == "--once" || a == "--loop"),
@@ -1972,7 +1972,7 @@ fn select_question(cfg: &ThinkCfg, led: &Ledger) -> Result<ledger::Scored, Strin
 /// Один цикл: выбор вопроса → проба → резолв → запись. Возвращает (qid, note, tokens).
 fn run_cycle(
     cfg: &ThinkCfg,
-    sdir: &PathBuf,
+    sdir: &Path,
     led: &mut Ledger,
     cache: &mut Cache,
     fetch: &HttpFetcher,
@@ -2103,7 +2103,10 @@ fn run_cycle(
                                     }
                                     Some(stance::aggregate(&ds))
                                 }
-                                (ledger::VerifyResult::Resolved, mode @ (Some("hybrid") | Some("llm"))) => {
+                                (
+                                    ledger::VerifyResult::Resolved,
+                                    mode @ (Some("hybrid") | Some("llm")),
+                                ) => {
                                     // лексика считается всегда: она бесплатна и служит опорой
                                     let ds: Vec<stance::Decision> = cands
                                         .iter()
@@ -2129,7 +2132,11 @@ fn run_cycle(
                                                 "    stance lexical {} ({:.2}) — LLM не нужен{}",
                                                 lexical.stance.as_str(),
                                                 lexical.confidence,
-                                                if is_prop { "" } else { " (не претензия)" }
+                                                if is_prop {
+                                                    ""
+                                                } else {
+                                                    " (не претензия)"
+                                                }
                                             );
                                         }
                                         Some(lexical)
@@ -2140,16 +2147,15 @@ fn run_cycle(
                                             .map(|c| stance::llm::Item {
                                                 id: c.id.as_str(),
                                                 title: c.title.as_str(),
-                                                abstract_text: c.abstract_text.as_deref().unwrap_or(""),
+                                                abstract_text: c
+                                                    .abstract_text
+                                                    .as_deref()
+                                                    .unwrap_or(""),
                                             })
                                             .collect();
                                         let jcfg = stance::llm::JudgeConfig::from_env();
                                         let out = stance::llm::judge_batch(
-                                            &jcfg,
-                                            &pick.id,
-                                            &pick.text,
-                                            &items,
-                                            &mut cache,
+                                            &jcfg, &pick.id, &pick.text, &items, &mut cache,
                                         );
                                         if let Err(e) = cache.save(sdir) {
                                             eprintln!("⚠️ кэш судьи не сохранён: {e}");
@@ -2236,7 +2242,14 @@ fn run_cycle(
                 (
                     Outcome::None,
                     vec![],
-                    format!("external: ничего не найдено по «{q}»{}", if errors.is_empty() { String::new() } else { format!(" ({})", errors.join("; ")) }),
+                    format!(
+                        "external: ничего не найдено по «{q}»{}",
+                        if errors.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", errors.join("; "))
+                        }
+                    ),
                     None,
                 )
             } else {
@@ -2274,7 +2287,10 @@ fn run_cycle(
                     None => (
                         Outcome::None,
                         vec![],
-                        format!("external: {} источников, измерения по претензии не найдено", cands.len()),
+                        format!(
+                            "external: {} источников, измерения по претензии не найдено",
+                            cands.len()
+                        ),
                         Some(stance::Decision::neutral(
                             "external",
                             "чужие данные не подтвердили и не опровергли претензию",
@@ -2340,12 +2356,7 @@ fn run_cycle(
             Some(ev) => {
                 let now = chrono::Utc::now();
                 match lab::validate(sdir, &ev, now, lab::DEFAULT_MAX_AGE_DAYS, &pick.text) {
-                    Err(why) => (
-                        Outcome::None,
-                        vec![],
-                        format!("lab: {why}"),
-                        None,
-                    ),
+                    Err(why) => (Outcome::None, vec![], format!("lab: {why}"), None),
                     Ok(()) => {
                         let stance_wanted = match ev.verdict {
                             lab::LabVerdict::Support => stance::Stance::Support,
@@ -2499,8 +2510,11 @@ fn run_cycle(
                         cons.opinions
                             .iter()
                             .filter(|o| !o.key_point.is_empty())
-                            .map(|o| format!("
-    • {}: {}", o.model, o.key_point))
+                            .map(|o| format!(
+                                "
+    • {}: {}",
+                                o.model, o.key_point
+                            ))
                             .collect::<String>()
                     ),
                     Some(d),
@@ -2544,7 +2558,7 @@ fn run_cycle(
     Ok((pick.id.clone(), note, judge_tokens))
 }
 
-fn cmd_think(args: &[String], sdir: &PathBuf) {
+fn cmd_think(args: &[String], sdir: &Path) {
     if args.iter().any(|a| a == "--report") {
         print_idle_report(sdir);
         if args.iter().any(|a| a == "--write") {
@@ -2717,7 +2731,7 @@ fn cmd_think(args: &[String], sdir: &PathBuf) {
 }
 
 /// Суточный отчёт: метрики, бюджет, состояние леджера, вердикт гейта.
-fn write_daily_report(sdir: &PathBuf, hours: Option<f64>) -> std::io::Result<PathBuf> {
+fn write_daily_report(sdir: &Path, hours: Option<f64>) -> std::io::Result<PathBuf> {
     use std::fmt::Write as _;
     let mut led = Ledger::load(sdir);
     // окно: только циклы за последние N часов (M4: отчёт за сутки)
@@ -2855,7 +2869,7 @@ fn write_daily_report(sdir: &PathBuf, hours: Option<f64>) -> std::io::Result<Pat
     Ok(path)
 }
 
-fn print_idle_report(sdir: &PathBuf) {
+fn print_idle_report(sdir: &Path) {
     let led = Ledger::load(sdir);
     let m = led.metrics();
     let verdict = if ledger::gate_failed(&m) {
@@ -2902,7 +2916,7 @@ fn stance_stats(cycles: &[ledger::Cycle]) -> (usize, usize) {
 }
 
 /// `lab` — лабораторные данные (ответ на lab-вопросы даёт эксперимент).
-fn cmd_lab(args: &[String], sdir: &PathBuf) {
+fn cmd_lab(args: &[String], sdir: &Path) {
     let sub = args.get(2).map(String::as_str).unwrap_or("list");
     match sub {
         "list" => {
@@ -2917,7 +2931,7 @@ fn cmd_lab(args: &[String], sdir: &PathBuf) {
                 println!("лабораторных вопросов нет: ledger add \"...\" --kind lab");
                 return;
             }
-            println!("{:<12} {:<9} {:<8} {}", "id", "status", "данные", "вопрос");
+            println!("{:<12} {:<9} {:<8} вопрос", "id", "status", "данные");
             for q in labs {
                 match lab::load(sdir, &q.id) {
                     None => println!(
@@ -2981,22 +2995,23 @@ fn cmd_lab(args: &[String], sdir: &PathBuf) {
 }
 
 /// `external` — чужие эксперименты и данные (Zenodo, GitHub) по lab-вопросам.
-fn cmd_external(args: &[String], sdir: &PathBuf) {
+fn cmd_external(args: &[String], sdir: &Path) {
     let sub = args.get(2).map(String::as_str).unwrap_or("list");
     let led = Ledger::load(sdir);
     match sub {
         "list" => {
             let mut n = 0;
-            for q in led.questions.iter().filter(|q| q.kind == ledger::QKind::Lab) {
-                match thirdparty::load(sdir, &q.id) {
-                    Some(ev) => {
-                        n += 1;
-                        println!(
-                            "{:<12} {} [{}] {} — {}",
-                            q.id, ev.verdict, ev.source, ev.title, ev.value
-                        );
-                    }
-                    None => {}
+            for q in led
+                .questions
+                .iter()
+                .filter(|q| q.kind == ledger::QKind::Lab)
+            {
+                if let Some(ev) = thirdparty::load(sdir, &q.id) {
+                    n += 1;
+                    println!(
+                        "{:<12} {} [{}] {} — {}",
+                        q.id, ev.verdict, ev.source, ev.title, ev.value
+                    );
                 }
             }
             if n == 0 {
@@ -3051,7 +3066,7 @@ fn cmd_external(args: &[String], sdir: &PathBuf) {
 }
 
 /// `council` — консилиум бесплатных моделей (мнение, не доказательство).
-fn cmd_council(args: &[String], sdir: &PathBuf) {
+fn cmd_council(args: &[String], sdir: &Path) {
     let sub = args.get(2).map(String::as_str).unwrap_or("models");
     let cc = dialogue::CouncilConfig::from_env();
     match sub {
@@ -3060,7 +3075,11 @@ fn cmd_council(args: &[String], sdir: &PathBuf) {
             for m in &cc.members {
                 println!("  {} → {} [{:?}]", m.model, m.url, m.api);
             }
-            println!("порог согласия: {} моделей, уверенность ≥ {:.2}", cc.min_agree, dialogue::ACT_CONF);
+            println!(
+                "порог согласия: {} моделей, уверенность ≥ {:.2}",
+                cc.min_agree,
+                dialogue::ACT_CONF
+            );
             println!("выключить: ARGUS_COUNCIL=0; сменить состав: ARGUS_COUNCIL_MODELS=\"m1,m2\"");
         }
         "ask" => {
@@ -3113,7 +3132,7 @@ fn cmd_council(args: &[String], sdir: &PathBuf) {
     }
 }
 
-fn cmd_ledger(args: &[String], sdir: &PathBuf) {
+fn cmd_ledger(args: &[String], sdir: &Path) {
     let sub = args.get(2).map(String::as_str).unwrap_or("list");
     let mut led = Ledger::load(sdir);
     match sub {
@@ -3123,8 +3142,8 @@ fn cmd_ledger(args: &[String], sdir: &PathBuf) {
                 return;
             }
             println!(
-                "{:<12} {:>6} {:>3}  {:<9} {:<3} {:<12} {}",
-                "id", "p", "n", "status", "вид", "форма", "вопрос"
+                "{:<12} {:>6} {:>3}  {:<9} {:<3} {:<12} вопрос",
+                "id", "p", "n", "status", "вид", "форма"
             );
             let mut qs = led.questions.clone();
             qs.sort_by(|a, b| a.status_key().cmp(&b.status_key()).then(a.id.cmp(&b.id)));

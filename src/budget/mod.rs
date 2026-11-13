@@ -58,8 +58,7 @@ impl Budget {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let s = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let s = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         fs::write(&self.path, s)
     }
 

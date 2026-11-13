@@ -155,8 +155,8 @@ pub fn gram(x: &[Vec<f64>]) -> Vec<Vec<f64>> {
     for i in 0..n {
         for j in i..n {
             let mut s = 0f64;
-            for k in 0..xc[i].len() {
-                s += xc[i][k] * xc[j][k];
+            for (a, b) in xc[i].iter().zip(xc[j].iter()) {
+                s += a * b;
             }
             a[i][j] = s;
             a[j][i] = s;
@@ -489,15 +489,13 @@ pub fn parse_ratings(text: &str, k: usize) -> Vec<f32> {
     for ch in text.chars() {
         if ch.is_ascii_digit() {
             cur.push(ch);
-        } else {
-            if !cur.is_empty() {
-                if let Ok(v) = cur.parse::<f32>() {
-                    if (0.0..=10.0).contains(&v) {
-                        nums.push(v / 10.0);
-                    }
+        } else if !cur.is_empty() {
+            if let Ok(v) = cur.parse::<f32>() {
+                if (0.0..=10.0).contains(&v) {
+                    nums.push(v / 10.0);
                 }
-                cur.clear();
             }
+            cur.clear();
         }
         if nums.len() == k {
             break;
