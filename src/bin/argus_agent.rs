@@ -7,6 +7,7 @@ use argus_pre::probe::{self, CorpusSearcher, EpMcSearcher, Searcher};
 use argus_pre::dialogue;
 use argus_pre::lab;
 use argus_pre::stance;
+use argus_pre::thirdparty;
 use argus_pre::verify::{self, Cache, HttpFetcher};
 use std::path::PathBuf;
 
@@ -48,6 +49,7 @@ fn main() {
         "ledger" => cmd_ledger(&args, &sdir),
         "lab" => cmd_lab(&args, &sdir),
         "council" => cmd_council(&args, &sdir),
+        "external" => cmd_external(&args, &sdir),
         "ticket" => cmd_ticket(&args, &sdir),
         "policy" => cmd_policy(&args, &sdir),
         "plan" => println!("План-режим (read-only): запусти run --mode plan."),
@@ -1946,7 +1948,7 @@ fn select_question(cfg: &ThinkCfg, led: &Ledger) -> Result<ledger::Scored, Strin
             cost: 1.0,
         });
     }
-    if cfg.channel == "lab" {
+    if cfg.channel == "lab" || cfg.channel == "external" {
         // лабораторный канал: только `lab`-вопросы, детерминированно по score
         let now = chrono::Utc::now();
         let mut best: Option<ledger::Scored> = None;
@@ -2214,6 +2216,112 @@ fn run_cycle(
                             resolved
                         };
                         (outcome, ids_out, note, stance_dec)
+                    }
+                }
+            }
+        }
+        // ── чужие эксперименты и данные: наборы данных/репозитории сообщества ──
+        "external" => {
+            let q = probe::build_query_for("epmc", &pick.text);
+            let (cands, errors) = thirdparty::gather(&q, thirdparty::PER_SOURCE);
+            if !cfg.quiet {
+                for e in &errors {
+                    println!("    ⚠️ {e}");
+                }
+                for c in &cands {
+                    println!("    {} [{}] {}", c.id, c.kind.as_str(), c.title);
+                }
+            }
+            if cands.is_empty() {
+                (
+                    Outcome::None,
+                    vec![],
+                    format!("external: ничего не найдено по «{q}»{}", if errors.is_empty() { String::new() } else { format!(" ({})", errors.join("; ")) }),
+                    None,
+                )
+            } else {
+                // судья: есть ли в описании измерение по нашей претензии (с цитатой)
+                let mut cache = stance::llm::JudgeCache::load(sdir);
+                let items: Vec<stance::llm::Item<'_>> = cands
+                    .iter()
+                    .map(|c| stance::llm::Item {
+                        id: c.id.as_str(),
+                        title: c.title.as_str(),
+                        abstract_text: c.summary.as_str(),
+                    })
+                    .collect();
+                let jcfg = stance::llm::JudgeConfig::from_env();
+                let out = stance::llm::judge_batch(&jcfg, &pick.id, &pick.text, &items, &mut cache);
+                let _ = cache.save(sdir);
+                if !cfg.quiet {
+                    for (c, d) in cands.iter().zip(out.decisions.iter()) {
+                        println!(
+                            "    judge {} {} ({:.2}) — {}",
+                            c.id,
+                            d.stance.as_str(),
+                            d.confidence,
+                            d.reason
+                        );
+                    }
+                }
+                let acting: Vec<(usize, &stance::Decision)> = out
+                    .decisions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.acts())
+                    .collect();
+                match acting.first().map(|(i, d)| (*i, (*d).clone())) {
+                    None => (
+                        Outcome::None,
+                        vec![],
+                        format!("external: {} источников, измерения по претензии не найдено", cands.len()),
+                        Some(stance::Decision::neutral(
+                            "external",
+                            "чужие данные не подтвердили и не опровергли претензию",
+                        )),
+                    ),
+                    Some((idx, d)) => {
+                        let c = &cands[idx];
+                        // источник обязан быть живым
+                        if let Err(why) = thirdparty::source_alive(&c.id) {
+                            (
+                                Outcome::None,
+                                vec![],
+                                format!("external: {} — {why}", c.id),
+                                None,
+                            )
+                        } else {
+                            let ev = thirdparty::ExternalEvidence {
+                                qid: pick.id.clone(),
+                                verdict: d.stance.as_str().to_string(),
+                                value: d.reason.clone(),
+                                source: c.id.clone(),
+                                title: c.title.clone(),
+                                note: format!("источник {}, {}", c.kind.as_str(), c.url),
+                                at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+                                third_party: true,
+                            };
+                            if let Err(e) = thirdparty::record(sdir, &ev) {
+                                eprintln!("⚠️ запись чужого свидетельства не сохранена: {e}");
+                            }
+                            let outcome = if d.stance == stance::Stance::Support {
+                                Outcome::Support
+                            } else {
+                                Outcome::Contradict
+                            };
+                            (
+                                outcome,
+                                vec![c.id.clone()],
+                                format!(
+                                    "external/{}: {} — «{}» ({})",
+                                    c.kind.as_str(),
+                                    d.stance.as_str(),
+                                    c.title,
+                                    d.reason
+                                ),
+                                Some(d),
+                            )
+                        }
                     }
                 }
             }
@@ -2869,6 +2977,76 @@ fn cmd_lab(args: &[String], sdir: &PathBuf) {
             }
         }
         _ => println!("lab list | lab record <qid> support|contradict|inconclusive --source ПУТЬ [--value ...] [--note ...] [--at ДАТА]"),
+    }
+}
+
+/// `external` — чужие эксперименты и данные (Zenodo, GitHub) по lab-вопросам.
+fn cmd_external(args: &[String], sdir: &PathBuf) {
+    let sub = args.get(2).map(String::as_str).unwrap_or("list");
+    let led = Ledger::load(sdir);
+    match sub {
+        "list" => {
+            let mut n = 0;
+            for q in led.questions.iter().filter(|q| q.kind == ledger::QKind::Lab) {
+                match thirdparty::load(sdir, &q.id) {
+                    Some(ev) => {
+                        n += 1;
+                        println!(
+                            "{:<12} {} [{}] {} — {}",
+                            q.id, ev.verdict, ev.source, ev.title, ev.value
+                        );
+                    }
+                    None => {}
+                }
+            }
+            if n == 0 {
+                println!("чужих свидетельств пока нет: набрать можно `external search <qid>`");
+            }
+        }
+        "search" => {
+            let qid = args.get(3).cloned().unwrap_or_default();
+            let Some(q) = led.get(&qid) else {
+                println!("нет такого вопроса: {qid}");
+                return;
+            };
+            let query = probe::build_query_for("epmc", &q.text);
+            println!("вопрос: {}", q.text);
+            println!("запрос: «{query}»");
+            let (cands, errors) = thirdparty::gather(&query, thirdparty::PER_SOURCE);
+            for e in &errors {
+                println!("  ⚠️ {e}");
+            }
+            if cands.is_empty() {
+                println!("  ничего не найдено");
+                return;
+            }
+            let items: Vec<stance::llm::Item<'_>> = cands
+                .iter()
+                .map(|c| stance::llm::Item {
+                    id: c.id.as_str(),
+                    title: c.title.as_str(),
+                    abstract_text: c.summary.as_str(),
+                })
+                .collect();
+            let mut cache = stance::llm::JudgeCache::load(sdir);
+            let jcfg = stance::llm::JudgeConfig::from_env();
+            let out = stance::llm::judge_batch(&jcfg, &qid, &q.text, &items, &mut cache);
+            let _ = cache.save(sdir);
+            for (c, d) in cands.iter().zip(out.decisions.iter()) {
+                println!(
+                    "  {} [{}] {} → {} ({:.2}) — {}",
+                    c.id,
+                    c.kind.as_str(),
+                    c.title,
+                    d.stance.as_str(),
+                    d.confidence,
+                    d.reason
+                );
+            }
+            println!("  {}", out.note);
+            println!("  (применить: `think --once --probe external --qid {qid}`)");
+        }
+        _ => println!("external list | external search <qid>"),
     }
 }
 

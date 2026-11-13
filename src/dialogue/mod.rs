@@ -47,7 +47,10 @@ pub enum Api {
 
 #[derive(Debug, Clone)]
 pub struct Member {
+    /// имя модели для API-запроса (ровно то, что ждёт провайдер)
     pub model: String,
+    /// подпись для журнала и отчёта: `groq/openai/gpt-oss-20b`
+    pub label: String,
     pub url: String,
     pub api: Api,
     pub api_key: Option<String>,
@@ -71,6 +74,7 @@ impl CouncilConfig {
             for m in ["qwen2.5:7b-16k", "llama3.2:latest", "hermes3:latest"] {
                 members.push(Member {
                     model: m.to_string(),
+                    label: m.to_string(),
                     url: std::env::var("ARGUS_COUNCIL_OLLAMA")
                         .unwrap_or_else(|_| "http://127.0.0.1:11434/api/chat".to_string()),
                     api: Api::Ollama,
@@ -102,12 +106,38 @@ impl CouncilConfig {
                 );
                 members.push(Member {
                     api_key: std::env::var(&key_var).ok().or_else(|| std::env::var("ARGUS_COUNCIL_KEY").ok()),
+                    label: model.clone(),
                     model,
                     url,
                     api: if is_ollama { Api::Ollama } else { Api::OpenAi },
                 });
             }
         }
+        // облачные бесплатные тиры (ключи берём из конфига pi, не из окружения)
+        if std::env::var("ARGUS_COUNCIL_CLOUD").map(|v| v != "0").unwrap_or(false) {
+            // cerebras → 402 payment required, together/fireworks → 403/биллинг,
+            // huggingface без ключа-router → не подключаем по умолчанию
+            let list = std::env::var("ARGUS_COUNCIL_PROVIDERS")
+                .unwrap_or_else(|_| "groq,openrouter".to_string());
+            for prov in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                let Some((base, key)) = CouncilConfig::provider_creds(prov) else {
+                    continue;
+                };
+                let model = CouncilConfig::discover_model(prov, 20)
+                    .or_else(|| CouncilConfig::free_model(prov).map(|m| m.to_string()));
+                let Some(model) = model else {
+                    continue;
+                };
+                members.push(Member {
+                    model: model.clone(),
+                    label: format!("{prov}/{model}"),
+                    url: format!("{base}/chat/completions"),
+                    api: Api::OpenAi,
+                    api_key: Some(key),
+                });
+            }
+        }
+
         CouncilConfig {
             members,
             timeout_secs: std::env::var("ARGUS_COUNCIL_TIMEOUT")
@@ -121,6 +151,106 @@ impl CouncilConfig {
         }
     }
 
+    /// Ключи и адреса бесплатных тиров из `~/.pi/agent/models.json`.
+    ///
+    /// Ключи уже лежат в конфиге pi — их не надо спрашивать у человека (решение Джабы
+    /// 14.11: «найди сам»). Читаем `providers.<name>.apiKey/baseUrl`, ничего не печатаем.
+    pub fn provider_creds(provider: &str) -> Option<(String, String)> {
+        let path = std::env::var("ARGUS_PROVIDERS_JSON")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                dirs::home_dir().map(|h| h.join(".pi/agent/models.json"))
+            })?;
+        let raw = std::fs::read_to_string(path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let p = v.get("providers")?.get(provider)?;
+        let key = p.get("apiKey")?.as_str()?.trim().to_string();
+        // `$DEEPINFRA_API_KEY` и подобные подстановки не раскрываем — только литеральные ключи
+        if key.is_empty() || key.starts_with('$') {
+            return None;
+        }
+        let mut base = p.get("baseUrl")?.as_str()?.trim_end_matches('/').to_string();
+        // домен api-inference.huggingface.co больше не резолвится — рабочий роутер
+        if provider == "huggingface" {
+            base = "https://router.huggingface.co/v1".to_string();
+        }
+        Some((base, key))
+    }
+
+    /// Модель по умолчанию для бесплатного тира провайдера (фолбэк, если discovery не сработал).
+    pub fn free_model(provider: &str) -> Option<&'static str> {
+        match provider {
+            "groq" => Some("openai/gpt-oss-20b"),
+            "cerebras" => Some("qwen-3.8-27b"),
+            "openrouter" => Some("meta-llama/llama-3.1-8b-instruct:free"),
+            "mistral" => Some("mistral-small-latest"),
+            "huggingface" => Some("meta-llama/Llama-3.1-8B-Instruct"),
+            _ => None,
+        }
+    }
+
+    /// Спросить у провайдера список моделей и выбрать разумную бесплатную.
+    /// Список моделей у бесплатных тиров меняется чаще, чем выходит наш код
+    /// (14.11: `llama-3.1-8b-instant` у Groq уже нет — вернулся 404).
+    pub fn discover_model(provider: &str, timeout_secs: u64) -> Option<String> {
+        let (base, key) = CouncilConfig::provider_creds(provider)?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs.max(5)))
+            .user_agent("argus-agent/council")
+            .build()
+            .ok()?;
+        let resp = client
+            .get(format!("{base}/models"))
+            .bearer_auth(&key)
+            .send()
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = resp.json().ok()?;
+        let ids: Vec<String> = v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        const BAD: [&str; 11] = [
+            "whisper", "guard", "tts", "embed", "rerank", "moderation", "image", "audio",
+            "vision-only", "code", "ocr",
+        ];
+        let mut cands: Vec<String> = ids
+            .into_iter()
+            .filter(|id| {
+                let low = id.to_lowercase();
+                !BAD.iter().any(|b| low.contains(b))
+            })
+            .collect();
+        // предпочтение: gpt-oss / qwen / llama / mistral — то, что умеет держать JSON-инструкцию
+        cands.sort_by_key(|id| {
+            let low = id.to_lowercase();
+            // у OpenRouter бесплатны только модели с суффиксом :free
+            if low.ends_with(":free") {
+                0
+            } else if low.contains("gpt-oss") {
+                1
+            } else if low.contains("qwen") {
+                2
+            } else if low.contains("llama") {
+                3
+            } else if low.contains("mistral") {
+                4
+            } else {
+                5
+            }
+        });
+        cands.into_iter().next()
+    }
+
     pub fn enabled() -> bool {
         match std::env::var("ARGUS_COUNCIL") {
             Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")),
@@ -131,7 +261,7 @@ impl CouncilConfig {
     pub fn label(&self) -> String {
         self.members
             .iter()
-            .map(|m| m.model.as_str())
+            .map(|m| m.label.as_str())
             .collect::<Vec<_>>()
             .join("+")
     }
@@ -305,7 +435,7 @@ pub fn consult(cfg: &CouncilConfig, question: &str, problem: &str, context: &str
         match ask_member(cfg, m, &prompt) {
             Ok(o) => opinions.push(o),
             Err(e) => opinions.push(Opinion {
-                model: format!("{}!", m.model),
+                model: format!("{}!", m.label),
                 stance: Stance::Neutral,
                 confidence: 0.0,
                 key_point: String::new(),
@@ -352,7 +482,11 @@ fn ask_member(cfg: &CouncilConfig, m: &Member, prompt: &str) -> Result<Opinion, 
     let status = resp.status();
     let body = resp.text().map_err(|e| format!("тело: {e}"))?;
     if !status.is_success() {
-        return Err(format!("HTTP {}", status.as_u16()));
+        return Err(format!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            body.chars().take(120).collect::<String>()
+        ));
     }
     let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("JSON: {e}"))?;
     let content = match m.api {
@@ -371,11 +505,20 @@ fn ask_member(cfg: &CouncilConfig, m: &Member, prompt: &str) -> Result<Opinion, 
             .get("choices")
             .and_then(|c| c.get(0))
             .and_then(|c| c.get("message"))
-            .and_then(|x| x.get("content"))
-            .and_then(|c| c.as_str()),
+            .map(|x| {
+                let c = x.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                if c.trim().is_empty() {
+                    // reasoning-модели (gpt-oss, ernie …) кладут текст в reasoning
+                    x.get("reasoning")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("")
+                } else {
+                    c
+                }
+            }),
     }
     .ok_or_else(|| "нет поля с ответом".to_string())?;
-    parse_opinion(&m.model, content)
+    parse_opinion(&m.label, content)
 }
 
 /// Разбор ответа одной модели.
@@ -524,6 +667,25 @@ mod tests {
         assert!(p.contains("ВОПРОС: Держит ли фокус?"));
         assert!(p.contains("ОПИСАНИЕ ПРОБЛЕМЫ: 72 ч съёмка"));
         assert!(p.contains("ИЗВЕСТНЫЕ ДАННЫЕ: дрейф 0.6 px/24 ч"));
+    }
+
+    #[test]
+    fn provider_creds_are_read_without_exposing_keys() {
+        if let Some((base, key)) = CouncilConfig::provider_creds("groq") {
+            assert!(base.starts_with("http"), "{base}");
+            assert!(!key.is_empty());
+            assert!(!key.starts_with('$'), "подстановки не раскрываем");
+        }
+        // несуществующий провайдер — просто None, без паники
+        assert!(CouncilConfig::provider_creds("нет-такого").is_none());
+    }
+
+    #[test]
+    fn free_model_table_has_no_paid_defaults() {
+        assert!(CouncilConfig::free_model("groq").is_some());
+        assert_eq!(CouncilConfig::free_model("groq"), Some("openai/gpt-oss-20b"));
+        assert!(CouncilConfig::free_model("deepseek").is_none(), "платные не по умолчанию");
+        assert!(CouncilConfig::free_model("deepinfra").is_none());
     }
 
     #[test]

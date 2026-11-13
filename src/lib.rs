@@ -14,5 +14,6 @@ pub mod probe;
 pub mod resume;
 pub mod skills;
 pub mod stance;
+pub mod thirdparty;
 pub mod tickets;
 pub mod verify;
