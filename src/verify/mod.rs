@@ -235,6 +235,29 @@ impl HttpFetcher {
             retries: http_retries(),
         }
     }
+
+    /// DataCite: DOI из Zenodo / arXiv (10.48550) / репозиториев — Crossref их не знает.
+    fn fetch_datacite(&self, doi: &str) -> Result<Option<Meta>, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .user_agent(USER_AGENT)
+            .build()
+            .map_err(|e| e.to_string())?;
+        let url = format!("https://api.datacite.org/dois/{doi}");
+        let resp = match client.get(&url).header("Accept", "application/json").send() {
+            Ok(r) => r,
+            Err(e) => return Err(e.to_string()),
+        };
+        let code = resp.status().as_u16();
+        if code == 404 || code == 410 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&code) {
+            return Err(format!("DataCite HTTP {code}"));
+        }
+        let body = resp.text().map_err(|e| e.to_string())?;
+        Ok(parse_datacite(&body))
+    }
 }
 
 impl Fetcher for HttpFetcher {
@@ -275,14 +298,20 @@ impl Fetcher for HttpFetcher {
                 self.retries + 1
             ));
         }
+        // DOI, зарегистрированный не в Crossref (Zenodo, arXiv 10.48550/, DataCite-репозитории),
+        // Crossref отдаёт 404/400. Проверяем DataCite, иначе честный DOI попадает в «fabricated».
+        if matches!(id.kind, IdKind::Doi)
+            && (code == 404 || code == 400 || (400..500).contains(&code))
+        {
+            if let Some(meta) = self.fetch_datacite(&id.value)? {
+                return Ok(Some(meta));
+            }
+            return Ok(None);
+        }
         if code == 404 {
             return Ok(None);
         }
         if !(200..300).contains(&code) {
-            // 400 от Crossref = битый DOI → это «не существует», а не «сеть упала»
-            if code == 400 && matches!(id.kind, IdKind::Doi) {
-                return Ok(None);
-            }
             return Err(format!("HTTP {code}"));
         }
         let body = resp.text().map_err(|e| e.to_string())?;
@@ -344,6 +373,38 @@ pub fn parse_crossref(body: &str) -> Option<Meta> {
             .and_then(|d| d.get(0))
             .and_then(|y| y.as_i64())
             .map(|y| y as i32),
+    })
+}
+
+/// Парсер ответа DataCite (`api.datacite.org/dois/{doi}`).
+pub fn parse_datacite(body: &str) -> Option<Meta> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let a = v.get("data")?.get("attributes")?;
+    let title = a
+        .get("titles")
+        .and_then(|t| t.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|t| t.get("title"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let container = a
+        .get("publisher")
+        .and_then(|p| p.as_str())
+        .unwrap_or("DataCite")
+        .to_string();
+    let year = a
+        .get("publicationYear")
+        .and_then(|y| y.as_i64())
+        .map(|y| y as i32);
+    Some(Meta {
+        title,
+        container,
+        year,
     })
 }
 
@@ -592,5 +653,26 @@ Scaling</title><published>2025-04-16T00:00:00Z</published></entry></feed>"#;
         let c2 = Cache::load(&dir);
         assert_eq!(c2.get_fresh("PMID:1").unwrap().status, Status::Resolved);
         assert_eq!(c2.stats().0, 1);
+    }
+}
+
+#[cfg(test)]
+mod datacite_tests {
+    use super::*;
+
+    #[test]
+    fn parses_datacite_zenodo_record() {
+        let body = r#"{"data":{"attributes":{"titles":[{"title":"Adaptive Cognitive System Ze"}],
+                       "publisher":"Longevity Horizon","publicationYear":2025}}}"#;
+        let m = parse_datacite(body).expect("должен распарситься");
+        assert_eq!(m.title, "Adaptive Cognitive System Ze");
+        assert_eq!(m.container, "Longevity Horizon");
+        assert_eq!(m.year, Some(2025));
+    }
+
+    #[test]
+    fn datacite_without_title_is_none() {
+        let body = r#"{"data":{"attributes":{"titles":[]}}}"#;
+        assert!(parse_datacite(body).is_none());
     }
 }

@@ -5,7 +5,7 @@ use argus_pre::dialogue;
 use argus_pre::lab;
 use argus_pre::ledger::{self, Ledger, Outcome};
 use argus_pre::memory::{Memory, NoteKind};
-use argus_pre::probe::{self, CorpusSearcher, EpMcSearcher, Searcher};
+use argus_pre::probe::{self, CorpusSearcher, MultiSearcher, Searcher};
 use argus_pre::stance;
 use argus_pre::thirdparty;
 use argus_pre::verify::{self, Cache, HttpFetcher};
@@ -1964,7 +1964,9 @@ fn select_question(cfg: &ThinkCfg, led: &Ledger) -> Result<ledger::Scored, Strin
         }
         return best.ok_or_else(|| "нет открытых лабораторных вопросов".to_string());
     }
-    let lit = cfg.channel == "epmc";
+    // литературный канал = любой внешний поиск (epmc, pubmed, openalex, crossref, arxiv,
+    // auto или перечисление через запятую)
+    let lit = probe::is_literature_channel(&cfg.channel);
     led.select_next_for(cfg.seed, cfg.k, lit)
         .ok_or_else(|| "нет открытых вопросов, подходящих под канал пробы".to_string())
 }
@@ -1988,12 +1990,31 @@ fn run_cycle(
     let mut judge_tokens: u64 = 0;
     let mut judge_note: Option<String> = None;
     let (outcome, ids, note, stance_dec) = match cfg.channel.as_str() {
-        "epmc" | "corpus" => {
-            let found = if cfg.channel == "epmc" {
-                EpMcSearcher::new(cfg.offline).search(&q, cfg.limit)
-            } else {
-                CorpusSearcher::new(&cfg.corpus).search(&q, cfg.limit)
-            };
+        "corpus" => {
+            let found = CorpusSearcher::new(&cfg.corpus).search(&q, cfg.limit);
+            match found {
+                Err(e) => (
+                    Outcome::None,
+                    vec![],
+                    format!("проба не удалась (corpus): {e}"),
+                    None,
+                ),
+                Ok(cands) if cands.is_empty() => (
+                    Outcome::None,
+                    vec![],
+                    format!("corpus: 0 попаданий по «{q}»"),
+                    None,
+                ),
+                Ok(cands) => (
+                    Outcome::Evidence,
+                    vec![],
+                    format!("corpus: {} совпадений (локальный корпус)", cands.len()),
+                    None,
+                ),
+            }
+        }
+        ch if probe::is_literature_channel(ch) => {
+            let found = MultiSearcher::new(ch, cfg.offline).search(&q, cfg.limit);
             match found {
                 Err(e) => (
                     Outcome::None,
@@ -2010,7 +2031,7 @@ fn run_cycle(
                 Ok(cands0) => {
                     let total = cands0.len();
                     // M3: семантика (word-level эмбеддинги) вместо грубого совпадения термов
-                    let (cands, dropped_v) = if cfg.channel == "epmc" {
+                    let (cands, dropped_v) = if probe::is_literature_channel(&cfg.channel) {
                         probe::filter_relevant_scored(&q, cands0, cfg.min_cos)
                     } else {
                         (cands0, vec![])

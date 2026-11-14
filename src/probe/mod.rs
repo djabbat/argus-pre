@@ -1,9 +1,18 @@
 //! P9/M2 — probe: read-only проба для idle-цикла.
 //!
-//! Три канала, все строго на чтение:
-//!   * `epmc`   — поиск по Europe PMC (научный «web.search»: сразу отдаёт PMID/DOI);
-//!   * `corpus` — поиск по локальному корпусу (*.md/*.txt): что уже написано у нас;
-//!   * `none`   — проба не выполняется (M1-поведение).
+//! Каналы (все строго на чтение):
+//!   * `epmc`     — Europe PMC (PMID/DOI + абстракт);
+//!   * `pubmed`   — NCBI E-utilities (esearch → esummary → efetch, абстракт из XML);
+//!   * `openalex` — OpenAlex (DOI + абстракт из inverted index);
+//!   * `crossref` — Crossref (`query.bibliographic`, абстракт из JATS);
+//!   * `arxiv`    — arXiv Atom API (`arXiv:` id + summary);
+//!   * `auto`     — все пять за один цикл (`MultiSearcher`, дедуп по id);
+//!   * `corpus`   — поиск по локальному корпусу (*.md/*.txt): что уже написано у нас;
+//!   * `none`     — проба не выполняется (M1-поведение).
+//!
+//! 2026-11-13: добавлены pubmed/openalex/crossref/arxiv + `auto`. Причина: канал epmc
+//! на узких технических претензиях (fiducial autofocus, фототоксичность) отдавал 0–1
+//! попадание, после семантического фильтра — 0, и цикл простаивал.
 //!
 //! Ключевое: поиск НЕ выносит суждение о вопросе. Он возвращает кандидатов с идентификаторами,
 //! которые затем обязан резолвить `verify`. Проба без суждения = `Outcome::Evidence`.
@@ -230,6 +239,527 @@ pub fn parse_epmc_candidates(body: &str, source: &str) -> Vec<Candidate> {
     out
 }
 
+// ── общий HTTP-клиент и ретраи ───────────────────────────────────────────────
+fn http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(25))
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+fn offline_requested(offline: bool) -> bool {
+    let env_offline = std::env::var("ARGUS_OFFLINE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    offline || env_offline
+}
+
+fn get_text(client: &reqwest::blocking::Client, url: &str, retries: u32) -> Result<String, String> {
+    let mut attempt = 0u32;
+    let mut last: Option<String> = None;
+    loop {
+        match client.get(url).send() {
+            Ok(r) if crate::verify::should_retry(r.status().as_u16()) && attempt < retries => {
+                std::thread::sleep(std::time::Duration::from_millis(crate::verify::backoff_ms(
+                    attempt,
+                )));
+                attempt += 1;
+            }
+            Ok(r) => {
+                let code = r.status().as_u16();
+                if code == 429 {
+                    return Err("rate limited (429) после ретраев".to_string());
+                }
+                if !r.status().is_success() {
+                    return Err(format!("HTTP {code}"));
+                }
+                return r.text().map_err(|e| e.to_string());
+            }
+            Err(e) if attempt < retries => {
+                std::thread::sleep(std::time::Duration::from_millis(crate::verify::backoff_ms(
+                    attempt,
+                )));
+                attempt += 1;
+                last = Some(e.to_string());
+            }
+            Err(e) => return Err(last.unwrap_or_else(|| e.to_string())),
+        }
+    }
+}
+
+/// Снять HTML/JATS-разметку из абстракта (Crossref отдаёт `<jats:p>`).
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// ── PubMed (NCBI E-utilities) ────────────────────────────────────────────────
+
+pub struct PubMedSearcher {
+    pub offline: bool,
+    pub retries: u32,
+}
+
+impl PubMedSearcher {
+    pub fn new(offline: bool) -> Self {
+        PubMedSearcher {
+            offline: offline_requested(offline),
+            retries: crate::verify::http_retries(),
+        }
+    }
+}
+
+impl Searcher for PubMedSearcher {
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<Candidate>, String> {
+        if self.offline {
+            return Err("offline".to_string());
+        }
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let client = http_client()?;
+        let n = limit.clamp(1, 10);
+        let esearch = format!(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&retmode=json&retmax={n}&term={}",
+            urlencode(query)
+        );
+        let body = get_text(&client, &esearch, self.retries)?;
+        let ids = parse_pubmed_ids(&body);
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let joined = ids.join(",");
+        let esummary = format!(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&retmode=json&id={joined}"
+        );
+        let summary = get_text(&client, &esummary, self.retries)?;
+        let efetch = format!(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&retmode=xml&id={joined}"
+        );
+        let abstracts = get_text(&client, &efetch, self.retries).unwrap_or_default();
+        Ok(parse_pubmed_candidates(&summary, &abstracts, "pubmed"))
+    }
+}
+
+/// Чистый парсер esearch-ответа (без сети).
+pub fn parse_pubmed_ids(body: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return vec![];
+    };
+    v.get("esearchresult")
+        .and_then(|r| r.get("idlist"))
+        .and_then(|r| r.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Чистый парсер esummary + efetch XML → кандидаты (без сети).
+pub fn parse_pubmed_candidates(
+    summary_json: &str,
+    abstracts_xml: &str,
+    source: &str,
+) -> Vec<Candidate> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(summary_json) else {
+        return vec![];
+    };
+    let Some(res) = v.get("result").and_then(|r| r.as_object()) else {
+        return vec![];
+    };
+    let abs_map = parse_pubmed_abstracts(abstracts_xml);
+    let mut out = Vec::new();
+    for (uid, item) in res {
+        if uid == "uids" {
+            continue;
+        }
+        let title = item
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('.')
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+        out.push(Candidate {
+            id: format!("PMID:{uid}"),
+            title,
+            source: source.to_string(),
+            abstract_text: abs_map.get(uid).cloned(),
+        });
+    }
+    out
+}
+
+fn parse_pubmed_abstracts(xml: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for chunk in xml.split("<PubmedArticle>").skip(1) {
+        let pmid = chunk
+            .split("<PMID")
+            .nth(1)
+            .and_then(|s| s.split_once('>').map(|x| x.1))
+            .and_then(|s| s.split_once("</PMID>").map(|x| x.0))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if pmid.is_empty() {
+            continue;
+        }
+        let mut text = String::new();
+        for part in chunk.split("<AbstractText").skip(1) {
+            if let Some((_, rest)) = part.split_once('>') {
+                if let Some((body, _)) = rest.split_once("</AbstractText>") {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(&strip_tags(body));
+                }
+            }
+        }
+        if !text.is_empty() {
+            map.insert(pmid, text);
+        }
+    }
+    map
+}
+
+// ── OpenAlex ─────────────────────────────────────────────────────────────────
+
+pub struct OpenAlexSearcher {
+    pub offline: bool,
+    pub retries: u32,
+}
+
+impl OpenAlexSearcher {
+    pub fn new(offline: bool) -> Self {
+        OpenAlexSearcher {
+            offline: offline_requested(offline),
+            retries: crate::verify::http_retries(),
+        }
+    }
+}
+
+impl Searcher for OpenAlexSearcher {
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<Candidate>, String> {
+        if self.offline {
+            return Err("offline".to_string());
+        }
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let client = http_client()?;
+        let url = format!(
+            "https://api.openalex.org/works?search={}&per-page={}&mailto=jaba@longevity.ge",
+            urlencode(query),
+            limit.clamp(1, 10)
+        );
+        let body = get_text(&client, &url, self.retries)?;
+        Ok(parse_openalex_candidates(&body, "openalex"))
+    }
+}
+
+/// Чистый парсер ответа OpenAlex (без сети). Абстракт собирается из inverted index.
+pub fn parse_openalex_candidates(body: &str, source: &str) -> Vec<Candidate> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return vec![];
+    };
+    let Some(arr) = v.get("results").and_then(|r| r.as_array()) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for r in arr {
+        let Some(doi_raw) = r.get("doi").and_then(|d| d.as_str()) else {
+            continue;
+        };
+        let doi = doi_raw
+            .trim_start_matches("https://doi.org/")
+            .trim_start_matches("http://doi.org/")
+            .to_string();
+        if doi.is_empty() {
+            continue;
+        }
+        let title = r
+            .get("display_name")
+            .or_else(|| r.get("title"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+        out.push(Candidate {
+            id: format!("doi:{doi}"),
+            title,
+            source: source.to_string(),
+            abstract_text: openalex_abstract(r),
+        });
+    }
+    out
+}
+
+fn openalex_abstract(work: &serde_json::Value) -> Option<String> {
+    let idx = work.get("abstract_inverted_index")?.as_object()?;
+    let mut pairs: Vec<(usize, &str)> = Vec::new();
+    for (word, positions) in idx {
+        if let Some(arr) = positions.as_array() {
+            for p in arr {
+                if let Some(pos) = p.as_u64() {
+                    pairs.push((pos as usize, word.as_str()));
+                }
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    pairs.sort_by_key(|(p, _)| *p);
+    let text = pairs
+        .into_iter()
+        .map(|(_, w)| w)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(text)
+}
+
+// ── Crossref ─────────────────────────────────────────────────────────────────
+
+pub struct CrossrefSearcher {
+    pub offline: bool,
+    pub retries: u32,
+}
+
+impl CrossrefSearcher {
+    pub fn new(offline: bool) -> Self {
+        CrossrefSearcher {
+            offline: offline_requested(offline),
+            retries: crate::verify::http_retries(),
+        }
+    }
+}
+
+impl Searcher for CrossrefSearcher {
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<Candidate>, String> {
+        if self.offline {
+            return Err("offline".to_string());
+        }
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let client = http_client()?;
+        let url = format!(
+            "https://api.crossref.org/works?query.bibliographic={}&rows={}&select=DOI,title,abstract",
+            urlencode(query),
+            limit.clamp(1, 10)
+        );
+        let body = get_text(&client, &url, self.retries)?;
+        Ok(parse_crossref_candidates(&body, "crossref"))
+    }
+}
+
+/// Чистый парсер ответа Crossref (без сети).
+pub fn parse_crossref_candidates(body: &str, source: &str) -> Vec<Candidate> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return vec![];
+    };
+    let Some(arr) = v
+        .get("message")
+        .and_then(|m| m.get("items"))
+        .and_then(|i| i.as_array())
+    else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for it in arr {
+        let Some(doi) = it.get("DOI").and_then(|d| d.as_str()) else {
+            continue;
+        };
+        let title = it
+            .get("title")
+            .and_then(|t| t.as_array())
+            .and_then(|a| a.first())
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+        out.push(Candidate {
+            id: format!("doi:{doi}"),
+            title,
+            source: source.to_string(),
+            abstract_text: it
+                .get("abstract")
+                .and_then(|a| a.as_str())
+                .map(strip_tags)
+                .filter(|t| !t.is_empty()),
+        });
+    }
+    out
+}
+
+// ── arXiv ────────────────────────────────────────────────────────────────────
+
+pub struct ArxivSearcher {
+    pub offline: bool,
+    pub retries: u32,
+}
+
+impl ArxivSearcher {
+    pub fn new(offline: bool) -> Self {
+        ArxivSearcher {
+            offline: offline_requested(offline),
+            retries: crate::verify::http_retries(),
+        }
+    }
+}
+
+impl Searcher for ArxivSearcher {
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<Candidate>, String> {
+        if self.offline {
+            return Err("offline".to_string());
+        }
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let client = http_client()?;
+        let url = format!(
+            "https://export.arxiv.org/api/query?search_query=all:{}&max_results={}",
+            urlencode(query),
+            limit.clamp(1, 10)
+        );
+        let body = get_text(&client, &url, self.retries)?;
+        Ok(parse_arxiv_candidates(&body, "arxiv"))
+    }
+}
+
+/// Чистый парсер Atom-ответа arXiv (без сети).
+pub fn parse_arxiv_candidates(xml: &str, source: &str) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for entry in xml.split("<entry>").skip(1) {
+        let id_raw = tag_text(entry, "id").unwrap_or_default();
+        // id вида http://arxiv.org/abs/2401.00001v2 → 2401.00001 (без версии)
+        let id = {
+            let mut s = id_raw.rsplit('/').next().unwrap_or("").trim().to_string();
+            if let Some(pos) = s.rfind('v') {
+                let tail_ok =
+                    !s[pos + 1..].is_empty() && s[pos + 1..].chars().all(|c| c.is_ascii_digit());
+                if tail_ok && pos > 0 {
+                    s.truncate(pos);
+                }
+            }
+            s
+        };
+        if id.is_empty() {
+            continue;
+        }
+        let title = tag_text(entry, "title").unwrap_or_default();
+        if title.is_empty() {
+            continue;
+        }
+        out.push(Candidate {
+            id: format!("arXiv:{id}"),
+            title,
+            source: source.to_string(),
+            abstract_text: tag_text(entry, "summary").filter(|t| !t.is_empty()),
+        });
+    }
+    out
+}
+
+fn tag_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let start = xml.find(&open)?;
+    let after = xml[start..].split_once('>')?.1;
+    let end = format!("</{tag}>");
+    let body = after.split(&end).next()?;
+    let text = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+// ── мульти-канал: несколько источников за один цикл ──────────────────────────
+
+pub const LIT_CHANNELS: [&str; 5] = ["epmc", "pubmed", "openalex", "crossref", "arxiv"];
+
+/// `auto` → все источники; `a,b,c` → перечисленные; одиночное имя → он один.
+pub fn parse_sources(channel: &str) -> Vec<String> {
+    match channel {
+        "auto" => LIT_CHANNELS.iter().map(|s| s.to_string()).collect(),
+        c if c.contains(',') => c
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| LIT_CHANNELS.contains(&s.as_str()))
+            .collect(),
+        c if LIT_CHANNELS.contains(&c) => vec![c.to_string()],
+        _ => vec![],
+    }
+}
+
+pub fn is_literature_channel(channel: &str) -> bool {
+    !parse_sources(channel).is_empty()
+}
+
+pub struct MultiSearcher {
+    pub sources: Vec<String>,
+    pub offline: bool,
+}
+
+impl MultiSearcher {
+    pub fn new(channel: &str, offline: bool) -> Self {
+        MultiSearcher {
+            sources: parse_sources(channel),
+            offline,
+        }
+    }
+}
+
+impl Searcher for MultiSearcher {
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<Candidate>, String> {
+        let mut all: Vec<Candidate> = Vec::new();
+        let mut errs: Vec<String> = Vec::new();
+        for s in &self.sources {
+            let r = match s.as_str() {
+                "epmc" => EpMcSearcher::new(self.offline).search(query, limit),
+                "pubmed" => PubMedSearcher::new(self.offline).search(query, limit),
+                "openalex" => OpenAlexSearcher::new(self.offline).search(query, limit),
+                "crossref" => CrossrefSearcher::new(self.offline).search(query, limit),
+                "arxiv" => ArxivSearcher::new(self.offline).search(query, limit),
+                _ => continue,
+            };
+            match r {
+                Ok(mut c) => all.append(&mut c),
+                Err(e) => errs.push(format!("{s}: {e}")),
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|c| seen.insert(c.id.clone()));
+        if all.is_empty() && !errs.is_empty() {
+            return Err(errs.join("; "));
+        }
+        all.truncate(limit.max(1) * 2);
+        Ok(all)
+    }
+}
+
 // ── локальный корпус ──────────────────────────────────────────────────────────
 
 pub struct CorpusSearcher {
@@ -441,7 +971,7 @@ pub fn glossary_terms(question: &str) -> Vec<String> {
 }
 
 pub fn build_query_for(channel: &str, question: &str) -> String {
-    if channel == "epmc" {
+    if is_literature_channel(channel) {
         let mut words: Vec<String> = build_query_en(question)
             .split_whitespace()
             .map(|w| w.to_string())
