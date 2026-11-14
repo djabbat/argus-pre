@@ -16,6 +16,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const CACHE_TTL_DAYS: i64 = 30;
+
+/// Версия логики резолва. Записи кэша, сделанные более старой версией `NotFound`,
+/// не переиспользуются: «не нашли» — вывод конкретного набора источников, а не факт.
+pub const CACHE_ENGINE: u32 = 2;
+
+fn engine_default() -> u32 {
+    1
+}
 pub const USER_AGENT: &str = "argus-pre/0.3.6 (idle-inference verify; mailto:jaba@longevity.ge)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +127,9 @@ pub struct Entry {
     pub checked_at: String,
     #[serde(default)]
     pub err: Option<String>,
+    /// какой версией резолвера получен вердикт (см. CACHE_ENGINE)
+    #[serde(default = "engine_default")]
+    pub engine: u32,
 }
 
 impl Entry {
@@ -129,6 +140,7 @@ impl Entry {
             meta,
             checked_at: Local::now().to_rfc3339(),
             err,
+            engine: CACHE_ENGINE,
         }
     }
 }
@@ -156,6 +168,15 @@ impl Cache {
     }
 
     fn is_fresh(e: &Entry) -> bool {
+        // `Resolved` (ID существует) не протухает никогда и не зависит от версии логики;
+        // `NotFound`/`Unverified` от старого резолвера перепроверяем — иначе один сетевой
+        // сбой навсегда закрепляет ложное обвинение в подделке и валит гейт.
+        if e.status == Status::Resolved {
+            return true;
+        }
+        if e.engine < CACHE_ENGINE {
+            return false;
+        }
         DateTime::parse_from_rfc3339(&e.checked_at)
             .ok()
             .map(|t| {
@@ -258,26 +279,17 @@ impl HttpFetcher {
         let body = resp.text().map_err(|e| e.to_string())?;
         Ok(parse_datacite(&body))
     }
-}
 
-impl Fetcher for HttpFetcher {
-    fn fetch(&self, id: &Id) -> Result<Option<Meta>, String> {
-        if self.offline {
-            return Err("offline".to_string());
-        }
+    /// Один GET с повторами на 429/5xx и сетевые ошибки. Возвращает (код, тело).
+    fn get(&self, url: &str, accept: &str) -> Result<(u16, String), String> {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .user_agent(USER_AGENT)
             .build()
             .map_err(|e| e.to_string())?;
-        let url = id.api_url();
         let mut attempt = 0u32;
         let resp = loop {
-            match client
-                .get(&url)
-                .header("Accept", "application/json, application/atom+xml;q=0.9")
-                .send()
-            {
+            match client.get(url).header("Accept", accept).send() {
                 Ok(r) if should_retry(r.status().as_u16()) && attempt < self.retries => {
                     std::thread::sleep(std::time::Duration::from_millis(backoff_ms(attempt)));
                     attempt += 1;
@@ -298,27 +310,233 @@ impl Fetcher for HttpFetcher {
                 self.retries + 1
             ));
         }
-        // DOI, зарегистрированный не в Crossref (Zenodo, arXiv 10.48550/, DataCite-репозитории),
-        // Crossref отдаёт 404/400. Проверяем DataCite, иначе честный DOI попадает в «fabricated».
-        if matches!(id.kind, IdKind::Doi)
-            && (code == 404 || code == 400 || (400..500).contains(&code))
-        {
-            if let Some(meta) = self.fetch_datacite(&id.value)? {
-                return Ok(Some(meta));
+        let body = resp.text().unwrap_or_default();
+        Ok((code, body))
+    }
+
+    /// PMID: два эндпоинта Europe PMC + независимый второй источник NCBI eutils.
+    /// «Нет в EPMC» — не доказательство несуществования: PMID мог быть только что
+    /// выдан и ещё не проиндексирован EPMC (13–14 ноя три настоящих PMID попали в «подделку»).
+    fn fetch_pmid(&self, id: &Id) -> Result<Option<Meta>, String> {
+        let epmc = [
+            format!(
+                "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID%3A{}%20AND%20SRC%3AMED&format=json&pageSize=1",
+                id.value
+            ),
+            format!(
+                "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID%3A{}&format=json&pageSize=1",
+                id.value
+            ),
+        ];
+        let mut clean_negative = false;
+        let mut transport_err: Option<String> = None;
+        for url in epmc {
+            match self.get(&url, "application/json") {
+                Ok((code, body)) if (200..300).contains(&code) => {
+                    if let Some(m) = parse_epmc_hit(&body) {
+                        return Ok(Some(m));
+                    }
+                    clean_negative = true;
+                }
+                Ok((code, _)) => {
+                    clean_negative = true;
+                    transport_err.get_or_insert(format!("EPMC HTTP {code}"));
+                }
+                Err(e) => {
+                    transport_err.get_or_insert(e);
+                }
             }
+        }
+        // второй источник: NCBI esummary (тот же PubMed, другой сервис)
+        let url = format!(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&retmode=json&id={}",
+            id.value
+        );
+        match self.get(&url, "application/json") {
+            Ok((code, body)) if (200..300).contains(&code) => {
+                if let Some(m) = parse_ncbi_esummary(&body, &id.value) {
+                    return Ok(Some(m));
+                }
+                clean_negative = true;
+            }
+            Ok((code, _)) => {
+                clean_negative = true;
+                transport_err.get_or_insert(format!("NCBI HTTP {code}"));
+            }
+            Err(e) => {
+                transport_err.get_or_insert(e);
+            }
+        }
+        if let Some(e) = transport_err {
+            return Err(format!(
+                "источники не дали полного ответа ({e}) — статус неизвестен, это не «подделка»"
+            ));
+        }
+        if clean_negative {
             return Ok(None);
         }
-        if code == 404 {
+        Err("ни один источник не ответил".to_string())
+    }
+
+    /// DOI: Crossref → DataCite → arXiv (для 10.48550/arxiv.*) → реестр handle doi.org.
+    /// Только чистое «нет» у всех четырёх даёт NotFound.
+    fn fetch_doi(&self, id: &Id) -> Result<Option<Meta>, String> {
+        let mut clean_negative = false;
+        let mut transport_err: Option<String> = None;
+        match self.get(
+            &format!("https://api.crossref.org/works/{}", id.value),
+            "application/json",
+        ) {
+            Ok((code, body)) if (200..300).contains(&code) => {
+                if let Some(m) = parse_crossref(&body) {
+                    return Ok(Some(m));
+                }
+                clean_negative = true;
+            }
+            Ok(_) => clean_negative = true,
+            Err(e) => {
+                transport_err.get_or_insert(e);
+            }
+        }
+        match self.fetch_datacite(&id.value) {
+            Ok(Some(m)) => return Ok(Some(m)),
+            Ok(None) => clean_negative = true,
+            Err(e) => {
+                transport_err.get_or_insert(e);
+            }
+        }
+        if let Some(ax) = arxiv_id_from_doi(&id.value) {
+            let axid = Id {
+                kind: IdKind::Arxiv,
+                value: ax,
+            };
+            match self.get(&axid.api_url(), "application/atom+xml") {
+                Ok((code, body)) if (200..300).contains(&code) => {
+                    if let Some(m) = parse_arxiv(&body) {
+                        return Ok(Some(m));
+                    }
+                    clean_negative = true;
+                }
+                Ok(_) => clean_negative = true,
+                Err(e) => {
+                    transport_err.get_or_insert(e);
+                }
+            }
+        }
+        // последняя инстанция: существует ли handle вообще (метаданных может не быть)
+        match self.get(
+            &format!("https://doi.org/api/handles/{}", id.value),
+            "application/json",
+        ) {
+            Ok((code, body)) if (200..300).contains(&code) => {
+                if doi_handle_exists(&body) {
+                    return Ok(Some(Meta {
+                        title: String::new(),
+                        container: "doi.org (handle существует)".to_string(),
+                        year: None,
+                    }));
+                }
+                clean_negative = true;
+            }
+            Ok(_) => clean_negative = true,
+            Err(e) => {
+                transport_err.get_or_insert(e);
+            }
+        }
+        if let Some(e) = transport_err {
+            return Err(format!(
+                "DOI-источники ответили не полностью ({e}) — статус неизвестен, это не «подделка»"
+            ));
+        }
+        if clean_negative {
             return Ok(None);
         }
-        if !(200..300).contains(&code) {
-            return Err(format!("HTTP {code}"));
+        Err("ни один DOI-источник не ответил".to_string())
+    }
+
+    fn fetch_arxiv(&self, id: &Id) -> Result<Option<Meta>, String> {
+        match self.get(&id.api_url(), "application/atom+xml") {
+            Ok((code, body)) if (200..300).contains(&code) => Ok(parse_arxiv(&body)),
+            Ok((404, _)) => Ok(None),
+            Ok((code, _)) => Err(format!("arXiv HTTP {code}")),
+            Err(e) => Err(e),
         }
-        let body = resp.text().map_err(|e| e.to_string())?;
+    }
+}
+
+/// DOI вида `10.48550/arxiv.1507.07385` → `1507.07385` (arXiv-ID).
+pub fn arxiv_id_from_doi(doi: &str) -> Option<String> {
+    let d = doi.trim().to_ascii_lowercase();
+    let rest = d.strip_prefix("10.48550/arxiv.")?;
+    let v = rest.trim().trim_end_matches('/').to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// Ответ `doi.org/api/handles/{doi}`: `responseCode == 1` — handle существует.
+pub fn doi_handle_exists(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("responseCode").and_then(|c| c.as_i64()))
+        .map(|c| c == 1)
+        .unwrap_or(false)
+}
+
+/// Ответ NCBI esummary (`db=pubmed&retmode=json`): uid в списке — запись существует.
+pub fn parse_ncbi_esummary(body: &str, pmid: &str) -> Option<Meta> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let res = v.get("result")?;
+    let uids: Vec<String> = res
+        .get("uids")
+        .and_then(|u| u.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !uids.iter().any(|u| u == pmid) {
+        return None;
+    }
+    let rec = res.get(pmid)?;
+    if rec.get("error").is_some() {
+        return None;
+    }
+    let title = rec
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let pubdate = rec.get("pubdate").and_then(|t| t.as_str()).unwrap_or("");
+    let year = pubdate
+        .split_whitespace()
+        .next()
+        .and_then(|y| y.parse::<i32>().ok())
+        .or_else(|| pubdate.chars().take(4).collect::<String>().parse().ok());
+    Some(Meta {
+        title,
+        container: rec
+            .get("fulljournalname")
+            .and_then(|t| t.as_str())
+            .unwrap_or("PubMed")
+            .to_string(),
+        year,
+    })
+}
+
+impl Fetcher for HttpFetcher {
+    fn fetch(&self, id: &Id) -> Result<Option<Meta>, String> {
+        if self.offline {
+            return Err("offline".to_string());
+        }
         match id.kind {
-            IdKind::Pmid => Ok(parse_epmc_hit(&body)),
-            IdKind::Doi => Ok(parse_crossref(&body)),
-            IdKind::Arxiv => Ok(parse_arxiv(&body)),
+            IdKind::Pmid => self.fetch_pmid(id),
+            IdKind::Doi => self.fetch_doi(id),
+            IdKind::Arxiv => self.fetch_arxiv(id),
         }
     }
 }
@@ -633,6 +851,56 @@ Scaling</title><published>2025-04-16T00:00:00Z</published></entry></feed>"#;
         let r = f.fetch(&id);
         assert!(r.is_err());
         assert_eq!(r.unwrap_err(), "offline");
+    }
+
+    #[test]
+    fn arxiv_doi_fallbacks_recognise_real_ids() {
+        // факты 14.11.2026: DOI существует (DataCite + doi.org handle), Crossref его не знает
+        assert_eq!(
+            arxiv_id_from_doi("10.48550/arxiv.1507.07385").as_deref(),
+            Some("1507.07385")
+        );
+        assert_eq!(arxiv_id_from_doi("doi:10.48550/ArXiv.2512.23554").as_deref(), None, "без префикса — не DOI");
+        assert_eq!(
+            arxiv_id_from_doi("10.48550/arxiv.2512.23554").as_deref(),
+            Some("2512.23554")
+        );
+        assert!(arxiv_id_from_doi("10.1038/nature12373").is_none());
+        assert!(doi_handle_exists(r#"{"responseCode":1,"handle":"..."}"#));
+        assert!(!doi_handle_exists(r#"{"responseCode":100}"#), "100 — handle не найден");
+        assert!(!doi_handle_exists("not json"));
+    }
+
+    #[test]
+    fn ncbi_esummary_confirms_pmid() {
+        let body = r#"{"header":{"type":"esummary","version":"0.3"},
+            "result":{"uids":["43026037"],
+            "43026037":{"uid":"43026037","pubdate":"2026 Nov 12",
+            "title":"A Triboelectric-Hydrogel System","fulljournalname":"Advanced science"}}}"#;
+        let m = parse_ncbi_esummary(body, "43026037").expect("должен подтвердить PMID");
+        assert_eq!(m.year, Some(2026));
+        assert!(m.title.starts_with("A Triboelectric"));
+        assert!(parse_ncbi_esummary(body, "99999999").is_none());
+        let err = r#"{"result":{"uids":[],"9999":{"error":"cannot get document summary"}}}"#;
+        assert!(parse_ncbi_esummary(err, "9999").is_none());
+    }
+
+    #[test]
+    fn stale_notfound_from_old_engine_is_rechecked() {
+        let mut c = cache_tmp("engine");
+        // запись, полученная старым резолвером (engine=1) и объявившая настоящий ID подделкой
+        let mut old = Entry::new("PMID:43026037", Status::NotFound, None, None);
+        old.engine = 1;
+        c.put(old);
+        assert!(
+            c.get_fresh("PMID:43026037").is_none(),
+            "старый NotFound не должен переиспользоваться"
+        );
+        // а Resolved — вечен, даже от старого резолвера
+        let mut res = Entry::new("PMID:1", Status::Resolved, None, None);
+        res.engine = 1;
+        c.put(res);
+        assert!(c.get_fresh("PMID:1").is_some());
     }
 
     #[test]

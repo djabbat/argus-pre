@@ -109,6 +109,30 @@ pub struct JudgeCache {
     pub entries: BTreeMap<String, CachedVerdict>,
 }
 
+/// Срок жизни вердикта судьи в кэше (дни): `ARGUS_JUDGE_TTL_DAYS`, по умолчанию 7.
+/// Без TTL кэш залипает навсегда: 14 ноя 106 neutral подряд шли из кэша, ни один
+/// новый текст не оценивался, `p` не двигалась.
+pub fn cache_ttl_days() -> i64 {
+    std::env::var("ARGUS_JUDGE_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|d| *d >= 0)
+        .unwrap_or(7)
+}
+
+fn verdict_is_fresh(at: &str) -> bool {
+    let ttl = cache_ttl_days();
+    if ttl == 0 {
+        return false;
+    }
+    chrono::DateTime::parse_from_rfc3339(at)
+        .map(|t| {
+            let age = chrono::Utc::now() - t.with_timezone(&chrono::Utc);
+            age < chrono::Duration::days(ttl)
+        })
+        .unwrap_or(false)
+}
+
 impl JudgeCache {
     pub fn path(state_dir: &Path) -> PathBuf {
         state_dir.join("ledger").join("stance_cache.json")
@@ -132,6 +156,11 @@ impl JudgeCache {
 
     pub fn get(&self, key: &str) -> Option<&CachedVerdict> {
         self.entries.get(key)
+    }
+
+    /// Кэш с TTL: устаревший вердикт не переиспользуется (текст мог смениться, модель — тоже).
+    pub fn get_fresh(&self, key: &str) -> Option<&CachedVerdict> {
+        self.entries.get(key).filter(|v| verdict_is_fresh(&v.at))
     }
 
     pub fn put(&mut self, key: String, v: CachedVerdict) {
@@ -376,7 +405,7 @@ pub fn judge_batch(
 
     for it in items {
         let key = cache_key(qid, it.id, &cfg.model);
-        if let Some(v) = cache.get(&key) {
+        if let Some(v) = cache.get_fresh(&key) {
             let stance = match v.stance.as_str() {
                 "support" => Stance::Support,
                 "contradict" => Stance::Contradict,
@@ -727,12 +756,39 @@ mod tests {
                 confidence: 0.0,
                 why: "нет позиции".into(),
                 model: "test-model".into(),
-                at: "now".into(),
+                at: chrono::Utc::now().to_rfc3339(),
             },
         );
         let out = judge_batch(&cfg_unreachable(), "q-1", Q, &items, &mut cache);
         assert!(out.note.contains("из кэша"), "{}", out.note);
         assert_eq!(out.decisions[0].stance, Stance::Neutral);
+    }
+
+    #[test]
+    fn stale_cached_verdict_is_rejudged() {
+        let mut cache = JudgeCache::default();
+        let items = vec![Item {
+            id: "PMID:7",
+            title: "t",
+            abstract_text: "a",
+        }];
+        let old = chrono::Utc::now() - chrono::Duration::days(cache_ttl_days() + 1);
+        cache.put(
+            cache_key("q-1", "PMID:7", "test-model"),
+            CachedVerdict {
+                stance: "neutral".into(),
+                confidence: 0.0,
+                why: "старый вердикт".into(),
+                model: "test-model".into(),
+                at: old.to_rfc3339(),
+            },
+        );
+        let out = judge_batch(&cfg_unreachable(), "q-1", Q, &items, &mut cache);
+        assert!(
+            !out.note.contains("из кэша"),
+            "устаревший вердикт должен быть переспрошен: {}",
+            out.note
+        );
     }
 
     #[test]

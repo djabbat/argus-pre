@@ -46,6 +46,7 @@ fn main() {
         "mcp" => cmd_mcp(&args, &sdir),
         "effects" => cmd_effects(&args, &sdir),
         "think" => cmd_think(&args, &sdir),
+        "verify" => cmd_verify(&args, &sdir),
         "ledger" => cmd_ledger(&args, &sdir),
         "lab" => cmd_lab(&args, &sdir),
         "council" => cmd_council(&args, &sdir),
@@ -1978,6 +1979,7 @@ fn run_cycle(
     led: &mut Ledger,
     cache: &mut Cache,
     fetch: &HttpFetcher,
+    dry: bool,
 ) -> Result<(String, String, u64), String> {
     let pick = select_question(cfg, led)?;
     let q = probe::build_query_for(&cfg.channel, &pick.text);
@@ -2550,6 +2552,17 @@ fn run_cycle(
         ),
     };
 
+    // гейт спеки §6 в исполнении: если провален — цикл доходит до пробы, но в леджер
+    // ничего не пишется (как --dry-run). Раньше отчёт обещал это, но код гейт не проверял.
+    if dry {
+        let _ = cache.save();
+        println!(
+            "  ⛔ dry-run (гейт провален): цикл НЕ записан — {} · {}",
+            pick.id, note
+        );
+        return Ok((pick.id.clone(), note, judge_tokens));
+    }
+
     let cycle = led
         .apply_judged(
             &pick.id,
@@ -2636,7 +2649,16 @@ fn cmd_think(args: &[String], sdir: &Path) {
     budget.max_tokens_per_day = cfg.budget_tokens;
 
     if !args.iter().any(|a| a == "--loop") {
-        match run_cycle(&cfg, sdir, &mut led, &mut cache, &fetch) {
+        let (gm, gate_bad, _) = gate_state(&led, sdir);
+        if gate_bad {
+            println!(
+                "⛔ гейт провален (окно {} ч: fabricated={}, резолв {:.2}) — цикл в --dry-run, запись отключена",
+                gate_window_hours(),
+                gm.fabricated_identifiers,
+                gm.identifier_resolution_rate
+            );
+        }
+        match run_cycle(&cfg, sdir, &mut led, &mut cache, &fetch, gate_bad) {
             Ok((_qid, _note, tokens)) => {
                 budget.record(chrono::Utc::now(), tokens);
                 let _ = budget.save();
@@ -2684,10 +2706,31 @@ fn cmd_think(args: &[String], sdir: &Path) {
         cfg.budget_cycles, cfg.budget_tokens, cfg.interval_secs, cfg.channel
     );
     let mut done: u64 = 0;
+    let mut gate_bad_last: Option<bool> = None;
     loop {
         // сервис живёт часами: подхватываем изменения леджера, сделанные снаружи
         led = Ledger::load(sdir);
         let now = chrono::Utc::now();
+        // гейт по окну (не по всей истории): провал держит цикл в --dry-run,
+        // но старые плохие циклы выпадают из окна и гейт восстанавливается сам;
+        // `ledger gate --reset` даёт ручной baseline, если причина устранена.
+        let (gm, gate_bad, _since) = gate_state(&led, sdir);
+        if gate_bad_last != Some(gate_bad) {
+            if gate_bad {
+                println!(
+                    "⛔ гейт провален (окно {} ч: fabricated={}, резолв {:.2}) — циклы в --dry-run, леджер не пишется",
+                    gate_window_hours(),
+                    gm.fabricated_identifiers,
+                    gm.identifier_resolution_rate
+                );
+            } else {
+                println!(
+                    "✅ гейт пройден (окно {} ч) — запись в леджер возобновлена",
+                    gate_window_hours()
+                );
+            }
+            gate_bad_last = Some(gate_bad);
+        }
         if let Err(why) = budget.gate(now) {
             if max_cycles.is_some() {
                 println!("⏸ {why} — цикл остановлен");
@@ -2702,7 +2745,7 @@ fn cmd_think(args: &[String], sdir: &Path) {
             std::thread::sleep(interval);
             continue;
         }
-        match run_cycle(&cfg, sdir, &mut led, &mut cache, &fetch) {
+        match run_cycle(&cfg, sdir, &mut led, &mut cache, &fetch, gate_bad) {
             Ok((qid, _note, tokens)) => {
                 budget.record(chrono::Utc::now(), tokens);
                 let _ = budget.save();
@@ -2751,19 +2794,43 @@ fn cmd_think(args: &[String], sdir: &Path) {
     }
 }
 
+/// Окно гейта (часы): `ARGUS_GATE_WINDOW_H`, по умолчанию 24.
+fn gate_window_hours() -> i64 {
+    std::env::var("ARGUS_GATE_WINDOW_H")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|h| *h > 0)
+        .unwrap_or(ledger::GATE_WINDOW_H)
+}
+
+/// Состояние гейта: (метрики окна, провален ли, с какого момента считаем).
+fn gate_state(
+    led: &Ledger,
+    sdir: &Path,
+) -> (ledger::Metrics, bool, chrono::DateTime<chrono::Utc>) {
+    let baseline = ledger::load_baseline(sdir);
+    let (m, since) = led.gate_metrics(chrono::Utc::now(), gate_window_hours(), baseline);
+    let bad = ledger::gate_failed(&m);
+    (m, bad, since)
+}
+
 /// Суточный отчёт: метрики, бюджет, состояние леджера, вердикт гейта.
 fn write_daily_report(sdir: &Path, hours: Option<f64>) -> std::io::Result<PathBuf> {
     use std::fmt::Write as _;
     let mut led = Ledger::load(sdir);
-    // окно: только циклы за последние N часов (M4: отчёт за сутки)
-    if let Some(h) = hours {
-        let cutoff = chrono::Utc::now() - chrono::Duration::minutes((h * 60.0) as i64);
-        led.cycles.retain(|c| {
-            chrono::DateTime::parse_from_rfc3339(&c.at)
-                .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
-                .unwrap_or(false)
-        });
-    }
+    // Окно отчёта = окно гейта (по умолчанию 24 ч), но не раньше ручного baseline.
+    let window_h = hours.unwrap_or(gate_window_hours() as f64);
+    let cutoff = chrono::Utc::now() - chrono::Duration::minutes((window_h * 60.0) as i64);
+    let baseline_at = ledger::load_baseline(sdir);
+    let since = match baseline_at {
+        Some(b) if b > cutoff => b,
+        _ => cutoff,
+    };
+    led.cycles.retain(|c| {
+        chrono::DateTime::parse_from_rfc3339(&c.at)
+            .map(|t| t.with_timezone(&chrono::Utc) >= since)
+            .unwrap_or(false)
+    });
     let m = led.metrics();
     let mut budget = argus_pre::budget::Budget::load(sdir);
     let now = chrono::Utc::now();
@@ -2771,7 +2838,7 @@ fn write_daily_report(sdir: &Path, hours: Option<f64>) -> std::io::Result<PathBu
     let day = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     let verdict = if ledger::gate_failed(&m) {
-        "❌ ГЕЙТ ПРОВАЛЕН (выдуманные ID или резолв < 0.7) → цикл в --dry-run"
+        "❌ ГЕЙТ ПРОВАЛЕН (выдуманные ID или резолв < 0.7) → цикл в --dry-run: запись в леджер ОТКЛЮЧЕНА (enforcement в think-цикле)"
     } else if m.id_cycles < 5 {
         "⏳ данных мало (<5 циклов с идентификаторами) — гейт не применяется"
     } else {
@@ -2782,6 +2849,14 @@ fn write_daily_report(sdir: &Path, hours: Option<f64>) -> std::io::Result<PathBu
     let _ = writeln!(s, "# idle-report — {day}\n");
     let _ = writeln!(s, "Сгенерировано: {}", now.to_rfc3339());
     let _ = writeln!(s, "Вердикт: **{verdict}**\n");
+    let _ = writeln!(
+        s,
+        "Окно: {window_h:.0} ч (с {}; baseline: {})\n",
+        since.to_rfc3339(),
+        baseline_at
+            .map(|b| b.to_rfc3339())
+            .unwrap_or_else(|| "нет".to_string())
+    );
     let _ = writeln!(s, "## Метрики\n");
     let _ = writeln!(s, "| метрика | значение |\n|---|---|");
     let _ = writeln!(s, "| циклов | {} |", m.cycles);
@@ -2892,15 +2967,15 @@ fn write_daily_report(sdir: &Path, hours: Option<f64>) -> std::io::Result<PathBu
 
 fn print_idle_report(sdir: &Path) {
     let led = Ledger::load(sdir);
-    let m = led.metrics();
-    let verdict = if ledger::gate_failed(&m) {
-        "❌ ГЕЙТ ПРОВАЛЕН (выдуманные ID или резолв < 0.7) → цикл в --dry-run"
+    let (m, gate_bad, since) = gate_state(&led, sdir);
+    let verdict = if gate_bad {
+        "❌ ГЕЙТ ПРОВАЛЕН (выдуманные ID или резолв < 0.7) → цикл в --dry-run (запись отключена)"
     } else if m.id_cycles < 5 {
         "⏳ данных мало (<5 циклов с идентификаторами) — гейт не применяется"
     } else {
         "✅ гейт пройден"
     };
-    println!("\n── метрики idle-цикла ──");
+    println!("\n── метрики idle-цикла (окно {} ч, с {}) ──", gate_window_hours(), since.to_rfc3339());
     println!(
         "циклов: {} (с идентификаторами {} · пробелов {})",
         m.cycles, m.id_cycles, m.gap_cycles
@@ -2924,6 +2999,11 @@ fn print_idle_report(sdir: &Path) {
     let (judged, acted) = stance_stats(&led.cycles);
     println!("stance: оценено {judged}, из них сдвинули p {acted}");
     println!("вердикт: {verdict}");
+    let duds = led.cycles.iter().filter(|c| (c.after - c.before).abs() < 1e-9).count();
+    println!(
+        "насыщение: {duds} циклов без сдвига p (штраф 0.5^k при выборе вопроса; кэш судьи TTL {} дн.)",
+        argus_pre::stance::llm::cache_ttl_days()
+    );
 }
 
 /// Сколько циклов получили позиционную оценку и сколько из них реально сдвинули p.
@@ -3342,7 +3422,41 @@ fn cmd_ledger(args: &[String], sdir: &Path) {
             println!("переоткрыто: {n}");
         }
         "report" => print_idle_report(sdir),
-        _ => println!("ledger list | add \"...\" [--p 0.5] [--kind lit|lab] | show <id> | seed | set-kind <id> lit|lab | reopen [id|all] | close <id> gap|refuted|supported [--note \"...\"] | supersede <old> <new> | report"),
+        "gate" => {
+            let hours = arg_num(args, "--hours")
+                .map(|v| v as i64)
+                .unwrap_or_else(gate_window_hours);
+            if args.iter().any(|a| a == "--reset") {
+                let note =
+                    arg_str(args, "--note").unwrap_or_else(|| "ручной baseline гейта".to_string());
+                match ledger::set_baseline(sdir, &note) {
+                    Ok(b) => println!("✅ baseline гейта: {} ({})", b.since, b.note),
+                    Err(e) => println!("⚠️ baseline не записан: {e}"),
+                }
+            }
+            let baseline = ledger::load_baseline(sdir);
+            let (m, since) = led.gate_metrics(chrono::Utc::now(), hours, baseline);
+            let bad = ledger::gate_failed(&m);
+            println!("окно: {hours} ч · счёт с {}", since.to_rfc3339());
+            println!(
+                "циклов {} · с ID {} · пробелов {} · resolved/unresolved/fabricated {} / {} / {}",
+                m.cycles, m.id_cycles, m.gap_cycles, m.resolved, m.unresolved, m.fabricated
+            );
+            println!(
+                "identifier_resolution_rate {:.2} · fabricated_identifiers {}",
+                m.identifier_resolution_rate, m.fabricated_identifiers
+            );
+            println!(
+                "вердикт: {}",
+                if bad {
+                    "❌ провален — think-цикл пишет в --dry-run"
+                } else {
+                    "✅ пройден"
+                }
+            );
+            println!("сбросить историю гейта: ledger gate --reset [--note \"причина\"]");
+        }
+        _ => println!("ledger list | add \"...\" [--p 0.5] [--kind lit|lab] | show <id> | seed | set-kind <id> lit|lab | reopen [id|all] | close <id> gap|refuted|supported [--note \"...\"] | supersede <old> <new> | gate [--reset] [--hours N] | report"),
     }
 }
 
@@ -3551,4 +3665,44 @@ fn cmd_memory(args: &[String], sdir: &std::path::Path) {
         }
         _ => println!("memory add|list|lessons|export --vault <path>"),
     }
+}
+
+/// `argus-agent verify PMID:1 doi:10.x/y arXiv:2504.13171 ...` — резолв идентификаторов
+/// без записи в леджер: что именно скажут источники и откуда вердикт.
+/// Нужно, чтобы отличать «ID выдуман» от «источник не ответил» руками, а не по отчёту.
+fn cmd_verify(args: &[String], sdir: &Path) {
+    let ids: Vec<verify::Id> = args
+        .iter()
+        .skip(2)
+        .filter(|a| !a.starts_with("--"))
+        .filter_map(|a| verify::Id::parse(a))
+        .collect();
+    if ids.is_empty() {
+        println!("использование: verify PMID:23663408 doi:10.1038/nature12373 arXiv:2504.13171 [--offline]");
+        return;
+    }
+    let offline = args.iter().any(|a| a == "--offline");
+    let mut cache = Cache::load(sdir);
+    let fetch = HttpFetcher::new(offline);
+    for id in &ids {
+        let entry = verify::resolve(id, &mut cache, &fetch);
+        let meta = entry
+            .meta
+            .as_ref()
+            .map(|m| {
+                let y = m.year.map(|y| y.to_string()).unwrap_or_default();
+                format!("{} {} · {}", m.container, y, m.title)
+            })
+            .unwrap_or_else(|| entry.err.clone().unwrap_or_default());
+        println!("{:<34} {:?} — {meta}", entry.id, entry.status);
+    }
+    if let Err(e) = cache.save() {
+        eprintln!("⚠️ кэш не сохранён: {e}");
+    }
+    let verdict = verify::to_ledger_verifier(
+        &ids.iter()
+            .filter_map(|id| cache.get_fresh(&id.key()).cloned())
+            .collect::<Vec<_>>(),
+    );
+    println!("вердикт леджера: {verdict:?}");
 }

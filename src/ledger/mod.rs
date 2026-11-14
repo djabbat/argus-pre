@@ -241,6 +241,9 @@ pub struct Cycle {
     pub form: Option<String>,
 }
 
+/// Сколько последних циклов вопроса смотреть при оценке насыщения пробы.
+pub const REPEAT_DUD_WINDOW: usize = 8;
+
 /// Оценка вопроса для очереди (спека §3.1).
 #[derive(Debug, Clone)]
 pub struct Scored {
@@ -443,8 +446,14 @@ pub fn score_question_for(q: &Question, now: DateTime<Utc>, lit_channel: bool) -
     let ref_ts = parse_ts(q.last_probed.as_deref().unwrap_or(&q.created))?;
     let staleness_h = ((now - ref_ts).num_seconds().max(0) as f64) / 3600.0;
     let cost = 1.0 + 0.25 * q.probes as f64;
+    // Информационная ценность вопроса, а не «сколько раз не нашлось»:
+    // бинарная энтропия H(p)/ln2 максимальна при p=0.5 и падает к 0 по мере того,
+    // как вопрос решён (p→0/1). Без этого уже почти решённые вопросы продолжают
+    // забирать бюджет (наблюдение 14.11: 106 neutral подряд, p не двигалась).
+    let p = q.p_true.clamp(1e-9, 1.0 - 1e-9);
+    let entropy = (-(p * p.ln() + (1.0 - p) * (1.0 - p).ln())) / std::f64::consts::LN_2;
     // пол свежести 0.5: иначе только что засеянный леджер даёт score=0 и выбор вырождается
-    let score = (0.1 + surprise) * (0.5 + (1.0 + staleness_h).ln()) / cost;
+    let score = (0.1 + surprise) * (0.4 + 0.6 * entropy) * (0.5 + (1.0 + staleness_h).ln()) / cost;
     Some(Scored {
         id: q.id.clone(),
         text: q.text.clone(),
@@ -571,14 +580,16 @@ impl Ledger {
         let now = Utc::now();
         // Честная очередь (фикс 13 ноя): без штрафа за недавний повтор один и тот же вопрос
         // выигрывал рулетку 5 раз в час (q-b6e15701), а 14 других не опрашивались вообще.
-        // Штраф 1/4 за каждый прогон за последний час: после третьего повтора вопрос
-        // уступает место тем, кого давно не трогали — возникает round-robin вместо залипания.
+        // Штраф 1/4 за каждый прогон за последний час. Плюс штраф 1/2 за каждый цикл,
+        // который НЕ сдвинул p: повтор той же пробы с тем же кэшем судьи не даёт информации
+        // (наблюдение 14.11: 4 цикла подряд с «все вердикты из кэша» и p без изменений).
         let mut ranked: Vec<Scored> = self
             .ranked_for(now, lit_channel)
             .into_iter()
             .map(|mut s| {
                 let hits = self.recent_hits(&s.id, now, 1);
-                s.score *= 0.25_f64.powi(hits.min(8) as i32);
+                let duds = self.recent_duds(&s.id, REPEAT_DUD_WINDOW);
+                s.score *= 0.25_f64.powi(hits.min(8) as i32) * 0.5_f64.powi(duds.min(6) as i32);
                 s
             })
             .collect();
@@ -614,6 +625,18 @@ impl Ledger {
             .iter()
             .filter(|c| c.qid == id)
             .filter(|c| parse_ts(&c.at).map(|t| t >= cutoff).unwrap_or(false))
+            .count()
+    }
+
+    /// Насыщение: сколько из последних `n` циклов вопроса не сдвинули p ни на йоту.
+    /// Такой цикл — повтор того же поиска с тем же кэшем судьи, то есть ноль информации.
+    pub fn recent_duds(&self, id: &str, n: usize) -> usize {
+        self.cycles
+            .iter()
+            .rev()
+            .filter(|c| c.qid == id)
+            .take(n)
+            .filter(|c| (c.after - c.before).abs() < 1e-9)
             .count()
     }
 
@@ -1016,6 +1039,68 @@ pub fn metrics(cycles: &[Cycle]) -> Metrics {
 /// Гейт спеки §6: провал, если есть выдуманные идентификаторы или резолв ниже порога.
 pub fn gate_failed(m: &Metrics) -> bool {
     m.fabricated_identifiers > 0 || (m.id_cycles >= 5 && m.identifier_resolution_rate < 0.7)
+}
+
+/// Окно гейта по умолчанию (часы). Гейт необратим, если считать его по всей истории:
+/// один плохой цикл держит «провал» вечно, даже когда причина устранена.
+pub const GATE_WINDOW_H: i64 = 24;
+
+/// Метрики только по циклам после `since` (окно + ручной baseline).
+pub fn metrics_since(cycles: &[Cycle], since: DateTime<Utc>) -> Metrics {
+    let kept: Vec<Cycle> = cycles
+        .iter()
+        .filter(|c| parse_ts(&c.at).map(|t| t >= since).unwrap_or(false))
+        .cloned()
+        .collect();
+    metrics(&kept)
+}
+
+impl Ledger {
+    /// Метрики для гейта: окно `hours` часов, но не раньше baseline (если он задан).
+    pub fn gate_metrics(
+        &self,
+        now: DateTime<Utc>,
+        hours: i64,
+        baseline: Option<DateTime<Utc>>,
+    ) -> (Metrics, DateTime<Utc>) {
+        let cutoff = now - chrono::Duration::hours(hours.max(1));
+        let since = match baseline {
+            Some(b) if b > cutoff => b,
+            _ => cutoff,
+        };
+        (metrics_since(&self.cycles, since), since)
+    }
+}
+
+/// Ручная отметка «гейт пересчитан с этого момента»: `ledger/gate_baseline.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateBaseline {
+    pub since: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+pub fn baseline_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("ledger").join("gate_baseline.json")
+}
+
+pub fn load_baseline(state_dir: &Path) -> Option<DateTime<Utc>> {
+    let s = fs::read_to_string(baseline_path(state_dir)).ok()?;
+    let b: GateBaseline = serde_json::from_str(&s).ok()?;
+    parse_ts(&b.since)
+}
+
+pub fn set_baseline(state_dir: &Path, note: &str) -> std::io::Result<GateBaseline> {
+    let p = baseline_path(state_dir);
+    if let Some(d) = p.parent() {
+        fs::create_dir_all(d)?;
+    }
+    let b = GateBaseline {
+        since: now_rfc3339(),
+        note: note.to_string(),
+    };
+    fs::write(&p, serde_json::to_string_pretty(&b).map_err(std::io::Error::other)?)?;
+    Ok(b)
 }
 
 /// Реальные открытые вопросы ARGUS-OS1 для засева (не выдуманные: из STATE/TODO/TRD).
