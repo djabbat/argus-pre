@@ -78,7 +78,12 @@ fn main() {
                         резолв PMID/DOI/arXiv → запись цикла + суточный отчёт
   (отдельный бинарник) argus-cka --corpus DIR [--a ngram] [--b wordhash|ratings:<model>]
                         [--n N] [--perms N] — M3: сходимость семантики (CKA + перестановочный нуль)
-  ledger list|add|show|seed|close|report
+  verify PMID:1 doi:10.1000/x arXiv:2504.13171 [--offline]
+                        резолв ID без записи в леджер: Resolved / NotFound / Unverified
+  ledger list|add|show|seed|close|report|gate
+        gate [--reset] [--hours N]
+                        вердикт гейта по окну (ARGUS_GATE_WINDOW_H, по умолчанию 24 ч);
+                        --reset ставит baseline «считать с этого момента»
                         P9: леджер открытых вопросов (prior с вероятностями)
   bench                    smoke-бенчмарк (3 задачи)
   eval --evals <file>       GAIA-lite / GAIA-L1 subset
