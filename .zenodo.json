@@ -1,0 +1,20 @@
+{
+    "title": "ARGUS-OS1 — argus-pre",
+    "description": "Local-first AI agent core (V3.6) for ARGUS-OS1. Runs the agent loop entirely on your machine: local or cloud LLM, file-based memory, safe tool execution.",
+    "upload_type": "software",
+    "access_right": "open",
+    "creators": [
+        {
+            "name": "Tqemaladze, Jaba",
+            "orcid": "0000-0001-8651-7243",
+            "affiliation": "Georgia Longevity Alliance"
+        }
+    ],
+    "keywords": [
+        "longevity",
+        "centriole",
+        "aging",
+        "argus-pre-public"
+    ],
+    "license": "MIT"
+}
