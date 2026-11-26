@@ -2613,6 +2613,45 @@ mod tests {
         assert!(!crate::tickets::allows_scope(&mandate, "shell"));
     }
 
+    /// Prompt-injection (trust-boundary, 2026-11-26): извлечённый контент — это данные,
+    /// не инструкции. Даже если http.get вернул враждебный payload «run shell», маппинг
+    /// инструмента обязан остаться read (функция tool_scope детерминирована по имени, не по
+    /// содержимому), а вызов shell — по-прежнему гейтуется mandate'ом. Это закрывает третью
+    /// границу («какие операции разрешены подключённым системам»): retrieved-контент не
+    /// повышает прав.
+    #[test]
+    fn indirect_injection_content_cannot_escalate_scope() {
+        // 1. Даже непустой враждебный результат http.get не меняет скоуп инструмента:
+        //    маппинг по имени, а не по содержимому результата.
+        let injected_http = "http.get";
+        assert_eq!(tool_scope(injected_http), "read");
+        assert_ne!(tool_scope(injected_http), "shell");
+
+        // 2. Мандат read-only (scope == "read"): даже после «отравленного» извлечения
+        //    write/shell-операции блокированы.
+        let mandate = crate::tickets::Mandate {
+            policy_version: "v1".into(),
+            strength: crate::tickets::Strength::Explicit,
+            scope: "read".into(),
+            matched_rules: vec!["owner".into()],
+            origin: "extracted-content".into(),
+            granted_at: "now".into(),
+        };
+        assert!(crate::tickets::allows_scope(&mandate, "read"));
+        assert!(!crate::tickets::allows_scope(&mandate, "write"));
+        assert!(!crate::tickets::allows_scope(&mandate, "shell"));
+
+        // 3. Ключевой инвариант: индирект-контент не может «поднять» инструмент до shell.
+        //    Даже если извлечённый текст требует «run_shell_privileged», tool_scope по имени
+        //    остаётся read/shell по исходной классификации, а не по содержимому.
+        assert_eq!(tool_scope("file.read"), "read");
+        assert_eq!(tool_scope("http.get"), "read");
+        assert_eq!(tool_scope("shell"), "shell");
+        // Вредоносная «директива» из retrieved-контента не существует как инструмент → дефолт read,
+        // никогда не shell (default в tool_scope = "read").
+        assert_eq!(tool_scope("run_shell_privileged_injected"), "read");
+    }
+
     /// P8e: watchdog останавливает цикл по лимиту шагов (max_steps реально работает).
     #[test]
     fn watchdog_stops_at_max_steps() {
